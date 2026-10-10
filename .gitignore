@@ -1,0 +1,12 @@
+node_modules/
+dist/
+backend/.venv/
+backend/dist/
+backend/build/
+backend/bin/
+__pycache__/
+*.pyc
+.pytest_cache/
+src-tauri/target/
+src-tauri/gen/
+backend/models/

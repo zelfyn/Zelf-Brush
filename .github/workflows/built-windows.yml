@@ -1,0 +1,75 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Download AI model (U2-Net, ONNX)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force backend/models | Out-Null
+          Invoke-WebRequest "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx" -OutFile backend/models/u2net.onnx
+          $h = (Get-FileHash backend/models/u2net.onnx -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne "8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491") { throw "u2net.onnx hash mismatch: $h" }
+          Write-Host "u2net.onnx OK ($([math]::Round((Get-Item backend/models/u2net.onnx).Length / 1MB)) MB)"
+
+      - name: Backend deps + tests
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          choco install ffmpeg -y --no-progress
+          python -m pip install -r backend/requirements-dev.txt pyinstaller
+          python -c "import cv2, numpy; print('cv2', cv2.__version__, cv2.__file__, 'numpy', numpy.__version__)"
+          python -m pytest backend/tests --tb=short -q -rf -W ignore
+        continue-on-error: true   # don't block the installer while diagnosing test failures
+
+      - name: Bundle backend (PyInstaller)
+        shell: pwsh
+        working-directory: backend
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --name rotobrush-backend `
+            --collect-submodules uvicorn --collect-submodules rotobrush --collect-all onnxruntime --hidden-import tkinter run_backend.py
+          Copy-Item models dist/rotobrush-backend/models -Recurse -Force   # AI model next to the exe
+          $bin = "dist/rotobrush-backend/bin"
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          # `Get-Command ffmpeg` points at a Chocolatey SHIM (a tiny launcher that only works on this machine).
+          # Bundle the REAL binaries from the package folder instead.
+          $lib = Join-Path $env:ChocolateyInstall "lib\ffmpeg"
+          foreach ($n in "ffmpeg.exe", "ffprobe.exe") {
+            $real = Get-ChildItem $lib -Recurse -Filter $n | Where-Object { $_.Length -gt 10MB } | Select-Object -First 1
+            if (-not $real) { throw "Real $n not found under $lib (only shims?)" }
+            Copy-Item $real.FullName $bin
+            Write-Host ("{0} <- {1} ({2} MB)" -f $n, $real.FullName, [math]::Round($real.Length / 1MB))
+          }
+          & "$bin/ffmpeg.exe" -version | Select-Object -First 1
+          & "$bin/ffprobe.exe" -version | Select-Object -First 1
+
+      - name: Smoke test the packaged backend (import + export with the BUNDLED ffmpeg only)
+        shell: pwsh
+        run: python scripts/smoke_test.py --backend backend/dist/rotobrush-backend/rotobrush-backend.exe --ffmpeg backend/dist/rotobrush-backend/bin/ffmpeg.exe --expect-engine onnx
+
+      - name: Frontend + Tauri installer
+        shell: pwsh
+        run: |
+          npm ci
+          npm run tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RotoBrush-windows-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe

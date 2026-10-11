@@ -17,7 +17,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import matte, video
+from . import fsutil, matte, video
 from .config import CREATE_NO_WINDOW, log_dir
 from .gpu import gpu_info
 from .jobs import Cancelled, Job
@@ -246,7 +246,7 @@ def export_video(p: Project, kind: str, s: dict, out_path: str | Path, job: Job 
                                  expect_audio=used_audio, fps=p.fps, exp_id=exp_id)
         xlog("Output validation", "passed")
         try:
-            os.replace(tmp_out, final)  # atomic: the final path only ever holds a finished, validated file
+            fsutil.replace(tmp_out, final)  # atomic: the final path only ever holds a finished, validated file
         except OSError as e:
             raise MediaError("The finished file could not be moved to the output location.",
                              ["Close any player that has the old file open", "Choose a different file name"],

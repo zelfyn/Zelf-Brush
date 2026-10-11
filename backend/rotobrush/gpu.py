@@ -79,7 +79,9 @@ def gpu_info(force: bool = False) -> dict:
     if cuda:
         info["mode"], info["message"] = "cuda", "CUDA available"
     elif ort_dml:
-        info["mode"], info["message"] = "directml", "GPU acceleration available through DirectML"
+        info["mode"] = "directml"
+        info["message"] = ("GPU acceleration available through DirectML" if smi else
+                           "DirectML runtime installed; it needs a DirectX 12 GPU, otherwise AI runs on the CPU")
     elif smi:
         info["mode"] = "cpu"
         info["message"] = "NVIDIA GPU detected, but no GPU-enabled AI runtime is installed. Using CPU mode."

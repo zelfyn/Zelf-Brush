@@ -13,6 +13,7 @@ from typing import Callable, Iterator
 
 import numpy as np
 
+from . import fsutil
 from .config import CREATE_NO_WINDOW, binary_candidates, log_dir
 
 log = logging.getLogger("rotobrush.ffmpeg")
@@ -304,5 +305,5 @@ def make_intermediate(info: VideoInfo, out: Path, on_progress: Callable[[int], N
         raise MediaError("The video could not be converted to a stable format.", ["See ffmpeg.log for details"],
                          stage="transcode", exit_code=proc.returncode, detail=first_error_line(msg),
                          log=str(log_dir() / "ffmpeg.log"))
-    os.replace(tmp, out)
+    fsutil.replace(tmp, out)
     return out

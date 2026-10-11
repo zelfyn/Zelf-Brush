@@ -12,6 +12,8 @@ from typing import Any, Callable, Iterator
 import cv2
 import numpy as np
 
+from . import fsutil
+
 
 class Op:
     def __init__(self, label: str, meta: dict) -> None:
@@ -76,9 +78,7 @@ class MaskStore:
                 p.unlink()
             self._present.discard(i)
         else:
-            tmp = p.with_suffix(".tmp")
-            tmp.write_bytes(data)
-            os.replace(tmp, p)
+            fsutil.atomic_write_bytes(p, data)
             self._present.add(i)
         self._cache.pop(i, None)
         self._ver[i] = self._ver.get(i, 0) + 1

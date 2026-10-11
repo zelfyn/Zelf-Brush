@@ -17,7 +17,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from . import video
+from . import fsutil, video
 from .config import PROXY_MAX_SIDE, VERSION
 from .jobs import Job
 from .masks import MaskStore
@@ -40,9 +40,7 @@ def proxy_size(w: int, h: int, max_side: int = PROXY_MAX_SIDE) -> tuple[int, int
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    fsutil.atomic_write_text(path, text)
 
 
 class Project:

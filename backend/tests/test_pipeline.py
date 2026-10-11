@@ -1,5 +1,6 @@
 """End-to-end tests: real FFmpeg, real segmentation/tracking, real exports, on a synthetic clip with known masks."""
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -329,8 +330,10 @@ def test_gpu_status_and_cpu_fallback(client, project):
     st = client.get("/system/status").json()
     assert st["gpu"]["mode"] in ("cpu", "cuda", "directml") and st["gpu"]["message"]
     assert st["active_engine"]["name"] in ("opencv", "onnx", "torch")
-    if not st["gpu"]["detected"]:
+    if not st["gpu"]["detected"] and st["gpu"]["mode"] == "cpu":
         assert "CPU mode" in st["gpu"]["message"]
+    if st["gpu"]["mode"] == "directml" and not st["gpu"]["detected"]:
+        assert "DirectX 12" in st["gpu"]["message"]  # must not claim acceleration it cannot confirm
 
 
 def test_missing_source_is_reported(client, project, tmp_path):
@@ -709,3 +712,89 @@ def test_backward_propagation_really_walks_backwards(client, clips, monkeypatch,
     assert np.mean(ious) > 0.9 and min(ious) > 0.75, [round(v, 2) for v in ious]
     client.patch("/project/settings", json={"engine": "auto"})
     engine_registry.reset_engines()
+
+
+# =====================================================================================================
+# Concurrency: autosave thread vs. tracking job writing the same files (WinError 32 on Windows CI)
+# =====================================================================================================
+def test_atomic_write_survives_concurrent_writers(tmp_path):
+    import threading
+    from rotobrush.project import _atomic_write
+    target = tmp_path / "tracking.json"
+    errors: list[BaseException] = []
+
+    def hammer(k: int) -> None:
+        try:
+            for i in range(150):
+                _atomic_write(target, json.dumps({"writer": k, "i": i, "pad": "x" * 2000}))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=hammer, args=(k,)) for k in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors, errors[:2]
+    assert json.loads(target.read_text())["pad"] == "x" * 2000          # last write is complete, never half-written
+    assert [p.name for p in tmp_path.iterdir()] == ["tracking.json"], "temporary files were left behind"
+
+
+def test_replace_retries_when_windows_has_the_file_briefly_locked(tmp_path, monkeypatch):
+    from rotobrush import fsutil
+    src, dst = tmp_path / "a.tmp", tmp_path / "a.json"
+    src.write_text("new")
+    dst.write_text("old")
+    real, calls = os.replace, {"n": 0}
+
+    def flaky(a, b):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(32, "The process cannot access the file because it is being used by another process")
+        return real(a, b)
+
+    monkeypatch.setattr(fsutil.os, "replace", flaky)
+    fsutil.replace(src, dst)
+    assert dst.read_text() == "new" and calls["n"] == 3
+
+
+def test_replace_gives_up_with_a_clear_error_if_the_file_stays_locked(tmp_path, monkeypatch):
+    from rotobrush import fsutil
+    src, dst = tmp_path / "b.tmp", tmp_path / "b.json"
+    src.write_text("x")
+    monkeypatch.setattr(fsutil.os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError(32, "locked")))
+    monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)
+    with pytest.raises(PermissionError):
+        fsutil.replace(src, dst, attempts=3)
+
+
+def test_tracking_job_survives_autosave_hammering_the_same_files(client, clips):
+    """The real-world race: the 20 s autosave thread fires while a tracking job is saving masks and tracking.json."""
+    import threading
+    r = client.post("/video/import", json={"path": str(clips["mp4"])})
+    assert r.status_code == 200
+    wait_cache(client)
+    client.patch("/project/settings", json={"engine": "opencv", "workArea": {"in": 0, "out": N - 1}})
+    p = S.project
+    p.masks.set(0, make_frame(0)[1])
+    p.add_keyframe(0, "user")
+    stop, errors = threading.Event(), []
+
+    def autosaver() -> None:
+        while not stop.is_set():
+            try:
+                p.touch()
+                p.autosave()
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+                return
+
+    th = threading.Thread(target=autosaver)
+    th.start()
+    try:
+        j = wait_job(client, client.post("/tracking/propagate", json={"frame": 0, "direction": "forward"}).json()["id"], 300)
+    finally:
+        stop.set()
+        th.join()
+    assert not errors, errors[:1]
+    assert j["status"] == "completed", j["error"]
+    assert p.masks.has(N - 1)
+    client.patch("/project/settings", json={"engine": "auto"})

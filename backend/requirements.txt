@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+numpy>=1.26
+opencv-python==4.13.0.92
+pydantic>=2.6
+onnxruntime-directml>=1.20,<2; sys_platform == "win32"   # GPU (DirectML) on any DX12 GPU incl. NVIDIA GTX/RTX
+onnxruntime>=1.20,<2; sys_platform != "win32"

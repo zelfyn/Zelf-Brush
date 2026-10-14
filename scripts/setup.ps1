@@ -1,0 +1,42 @@
+<#
+  One-time setup on Windows 10/11.
+    powershell -ExecutionPolicy Bypass -File scripts\setup.ps1          # GPU-capable ONNX engine (DirectML) + model
+    powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Gpu     # additionally PyTorch CUDA + SAM 2 (optional, ~3 GB)
+#>
+param([switch]$Gpu)
+$ErrorActionPreference = "Stop"
+Set-Location (Split-Path $PSScriptRoot -Parent)
+
+function Need($cmd, $hint) {
+  if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { Write-Host "MISSING: $cmd  ->  $hint" -ForegroundColor Red; $script:missing = $true }
+}
+$missing = $false
+Need python "winget install Python.Python.3.12"
+Need node   "winget install OpenJS.NodeJS.LTS"
+Need ffmpeg "winget install Gyan.FFmpeg   (or put ffmpeg.exe + ffprobe.exe in backend\bin)"
+Need cargo  "winget install Rustlang.Rustup   (only needed to build the Tauri desktop shell)"
+if ($missing) { Write-Host "Install the missing tools, open a NEW terminal and run this script again." -ForegroundColor Yellow }
+
+Write-Host "== Python backend ==" -ForegroundColor Cyan
+python -m venv backend\.venv
+& backend\.venv\Scripts\python.exe -m pip install --upgrade pip
+& backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt
+
+Write-Host "== AI models (segmentation + depth; run on the GPU through DirectML) ==" -ForegroundColor Cyan
+& (Join-Path $PSScriptRoot "download-models.ps1")
+
+if ($Gpu) {
+  Write-Host "== Deep-learning engine (PyTorch CUDA + SAM 2) ==" -ForegroundColor Cyan
+  & backend\.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+  & backend\.venv\Scripts\python.exe -m pip install "git+https://github.com/facebookresearch/sam2.git"
+  $models = Join-Path $env:LOCALAPPDATA "Zelf-Brush\models"
+  New-Item -ItemType Directory -Force $models | Out-Null
+  $ckpt = Join-Path $models "sam2.1_hiera_small.pt"
+  if (-not (Test-Path $ckpt)) {
+    Invoke-WebRequest "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt" -OutFile $ckpt
+  }
+}
+
+Write-Host "== Frontend ==" -ForegroundColor Cyan
+npm install
+Write-Host "Setup finished. Next: scripts\dev.ps1" -ForegroundColor Green

@@ -1,3 +1,0 @@
-# Optional deep-learning engine (install AFTER choosing the right torch build, see scripts/setup.ps1 -Gpu)
-# torch / torchvision: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-# SAM 2 (Apache-2.0): pip install git+https://github.com/facebookresearch/sam2.git

@@ -351,15 +351,18 @@ class OnnxEngine(SegmentationEngine):
 
     @property
     def provider(self) -> str:  # type: ignore[override]
+        """Report the provider used by a loaded session, not merely an installed provider.
+
+        get_available_providers() only lists provider plugins bundled with ONNX Runtime; it
+        does not guarantee that a compatible GPU/device is present. DirectML can therefore
+        be listed on headless/virtual Windows machines even though session creation falls
+        back to CPU. Before the first model session is created, report CPU (the only provider
+        we can confirm is active) so `provider` and `accelerated` never contradict each other.
+        """
         rt = self._primary
-        if rt is not None:
-            return {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}.get(rt.provider, "CPU")
-        try:
-            import onnxruntime as ort
-            av = ort.get_available_providers()
-            return "CUDA" if "CUDAExecutionProvider" in av else "DirectML" if "DmlExecutionProvider" in av else "CPU"
-        except Exception:  # noqa: BLE001
+        if rt is None:
             return "CPU"
+        return {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}.get(rt.provider, "CPU")
 
     @property
     def accelerated(self) -> bool:  # type: ignore[override]

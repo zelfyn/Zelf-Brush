@@ -207,15 +207,54 @@ def _open_comp(comp: Comp) -> dict:
     return _state(comp)
 
 
+class PathReqEarly(BaseModel):
+    path: str
+
+
 class ImportReq(BaseModel):
     path: str
+    trimIn: int | None = None       # first source frame to keep (from the import dialog)
+    trimOut: int | None = None      # last source frame to keep
+    name: str | None = None
+    aiModel: str | None = None
+
+
+def _trim_of(req: "ImportReq") -> tuple[int, int] | None:
+    if req.trimIn is None and req.trimOut is None:
+        return None
+    return int(req.trimIn or 0), int(req.trimOut if req.trimOut is not None else 10 ** 9)
+
+
+@app.post("/video/probe")
+def video_probe(req: PathReqEarly) -> dict:
+    """Metadata for the import dialog (nothing is imported yet)."""
+    return video.probe_cached(req.path).to_dict()
+
+
+@app.get("/video/frame")
+def video_frame(path: str, index: int = 0, w: int = 640) -> Response:
+    """One frame of a video that has not been imported yet (import dialog preview and trim)."""
+    return Response(video.preview_jpeg(path, index, w), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.post("/video/stage")
+async def video_stage(file: UploadFile = File(...)) -> dict:
+    """Browser dev mode: save an uploaded video so the import dialog can preview it. Tauri passes real paths instead."""
+    dest_dir = app_data_dir() / "uploads"
+    dest_dir.mkdir(exist_ok=True)
+    dest = dest_dir / Path(file.filename or "upload.mp4").name
+    with dest.open("wb") as f:
+        while chunk := await file.read(8 * 1024 * 1024):
+            f.write(chunk)
+    info = await asyncio.get_running_loop().run_in_executor(None, lambda: video.probe_cached(dest))
+    return {"path": str(dest), "info": info.to_dict()}
 
 
 @app.post("/video/import")
 def video_import(req: ImportReq) -> dict:
     """New composition from one video."""
     info = video.probe(req.path)
-    comp = Comp.create(info, workspace_dir())
+    comp = Comp.create(info, workspace_dir(), name=req.name, trim=_trim_of(req), layer_name=req.name, ai_model=req.aiModel)
     log.info("imported %s (%dx%d @ %.3f fps, %d frames)", info.filename, info.width, info.height, info.fps, info.frame_count)
     return _open_comp(comp)
 
@@ -276,6 +315,10 @@ def comp_get() -> dict:
 class AddLayerReq(BaseModel):
     path: str
     start: int | None = None
+    trimIn: int | None = None
+    trimOut: int | None = None
+    name: str | None = None
+    aiModel: str | None = None
 
 
 @app.post("/layers/add")
@@ -283,7 +326,8 @@ def layer_add(req: AddLayerReq) -> dict:
     """Add a video as a new layer on top of the stack (starts at `start`, default 0)."""
     comp = S.require_comp()
     info = video.probe(req.path)
-    lid = comp.add_layer(info, start=req.start)
+    trim = None if req.trimIn is None and req.trimOut is None else (int(req.trimIn or 0), int(req.trimOut if req.trimOut is not None else 10 ** 9))
+    lid = comp.add_layer(info, start=req.start, name=req.name, trim=trim, ai_model=req.aiModel)
     _cache_jobs(comp, lid)
     return _state(comp)
 
@@ -305,6 +349,8 @@ class LayerPatch(BaseModel):
 def layer_patch(layer_id: str, req: LayerPatch) -> dict:
     comp = S.require_comp()
     comp.update_layer(layer_id, req.model_dump(exclude_none=True))
+    if req.trimIn is not None or req.trimOut is not None:
+        _cache_jobs(comp, layer_id)  # no-op when the range is already cached
     return _state(comp)
 
 
@@ -436,6 +482,7 @@ class SelectReq(BaseModel):
 @app.post("/segmentation/select")
 def seg_select(req: SelectReq) -> dict:
     p = S.require()
+    _cancel_auto(p)
     ops.select_object(p, req.frame, req.mode, req.points, req.negative, req.box, req.object_id)
     return {"ok": True, "frame": req.frame}
 
@@ -448,8 +495,15 @@ class AutoReq(BaseModel):
 @app.post("/rotoscope/auto")
 def rotoscope_auto(req: AutoReq) -> dict:
     p = S.require()
+    _cancel_auto(p)
     job = jobs.submit("process", "auto-roto", "Auto roto", lambda j: ops.auto_roto(p, req.frame, req.object_ids, j))
     return job.public()
+
+
+def _cancel_auto(p: Project) -> None:
+    """A manual edit always wins: stop this layer's background AI updates (and wait until they have really stopped,
+    so they cannot overwrite what the user is about to do)."""
+    jobs.cancel_group(("auto-update", "ai-refine"), group=str(p.root))
 
 
 # ---------------------------------------------------------------- manual mask tools
@@ -464,6 +518,7 @@ class StrokeReq(BaseModel):
 
 @app.post("/mask/stroke")
 def mask_stroke(req: StrokeReq) -> dict:
+    _cancel_auto(S.require())
     ops.brush(S.require(), req.frame, req.mode, req.points, req.size, req.hardness, req.strength)
     return {"ok": True}
 
@@ -473,12 +528,39 @@ class LassoReq(BaseModel):
     polygon: list[list[float]] = Field(min_length=3)
     mode: Literal["add", "remove"] = "add"
     ai_refine: bool = True
+    wait: bool = False  # True = refine before answering (scripts/tests); the UI uses the instant + background path
 
 
 @app.post("/mask/lasso")
 def mask_lasso(req: LassoReq) -> dict:
-    ops.lasso(S.require(), req.frame, req.polygon, "add" if req.mode == "add" else "subtract", req.ai_refine)
+    p = S.require()
+    _cancel_auto(p)
+    mode = "add" if req.mode == "add" else "subtract"
+    if req.ai_refine and not req.wait:
+        # the polygon is applied instantly; snapping it to the real edges happens in the background
+        pending = ops.lasso(p, req.frame, req.polygon, mode, True, defer_refine=True)
+        job = jobs.submit("auto", "ai-refine", "Snapping to edges", lambda j: ops.lasso_refine(p, req.frame, pending, j), group=str(p.root))
+        return {"ok": True, "refining": job.id}
+    ops.lasso(p, req.frame, req.polygon, mode, req.ai_refine)
     return {"ok": True}
+
+
+class AutoUpdateReq(BaseModel):
+    frame: int
+    forward: int = 30
+    backward: int = 0
+
+
+@app.post("/mask/auto-update")
+def mask_auto_update(req: AutoUpdateReq) -> dict:
+    """After a manual edit: carry the correction to the neighbouring frames in the background (cancellable)."""
+    p = S.require()
+    if not p.masks.has(req.frame) or (req.forward <= 0 and req.backward <= 0):
+        return {"skipped": True}
+    jobs.cancel_group(("auto-update",), group=str(p.root))  # a newer edit supersedes the previous update
+    job = jobs.submit("auto", "auto-update", "Updating nearby frames",
+                      lambda j: ops.auto_update(p, req.frame, req.forward, req.backward, j), group=str(p.root))
+    return job.public()
 
 
 class FrameReq(BaseModel):
@@ -487,12 +569,14 @@ class FrameReq(BaseModel):
 
 @app.post("/mask/clear")
 def mask_clear(req: FrameReq) -> dict:
+    _cancel_auto(S.require())
     ops.clear_mask(S.require(), req.frame)
     return {"ok": True}
 
 
 @app.post("/mask/undo")
 def mask_undo() -> dict:
+    _cancel_auto(S.require())
     r = S.require().masks.undo()
     S.require().touch()
     return {"label": r[0] if r else None, "frames": r[1] if r else []}
@@ -500,6 +584,7 @@ def mask_undo() -> dict:
 
 @app.post("/mask/redo")
 def mask_redo() -> dict:
+    _cancel_auto(S.require())
     r = S.require().masks.redo()
     S.require().touch()
     return {"label": r[0] if r else None, "frames": r[1] if r else []}
@@ -515,6 +600,7 @@ class PropReq(BaseModel):
 @app.post("/tracking/propagate")
 def tracking_propagate(req: PropReq) -> dict:
     p = S.require()
+    _cancel_auto(p)
     if not p.masks.has(req.frame):
         raise MediaError("There is no mask on this frame to propagate.",
                          ["Run Auto Roto or paint a mask with Brush or Lasso first"])

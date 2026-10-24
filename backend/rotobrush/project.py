@@ -107,22 +107,25 @@ class Project:
         self.touch()
 
     def add_keyframe(self, frame: int, kind: str) -> None:
-        kfs = self.data["keyframes"]
-        for k in kfs:
-            if k["frame"] == frame:
-                if kind == "user":
-                    k["kind"] = "user"
-                return
-        kfs.append({"frame": frame, "kind": kind})
-        kfs.sort(key=lambda k: k["frame"])
-        self.touch()
+        with self.lock:
+            kfs = self.data["keyframes"]
+            for k in kfs:
+                if k["frame"] == frame:
+                    if kind == "user":
+                        k["kind"] = "user"
+                    return
+            kfs.append({"frame": frame, "kind": kind})
+            kfs.sort(key=lambda k: k["frame"])
+            self.touch()
 
     def user_keyframes(self) -> list[int]:
-        return [k["frame"] for k in self.data["keyframes"] if k["kind"] == "user"]
+        with self.lock:
+            return [k["frame"] for k in self.data["keyframes"] if k["kind"] == "user"]
 
     def set_confidence(self, frame: int, value: float) -> None:
-        self.data["tracking"]["confidence"][str(frame)] = round(float(value), 3)
-        self.touch()
+        with self.lock:
+            self.data["tracking"]["confidence"][str(frame)] = round(float(value), 3)
+            self.touch()
 
     # ---------- creation / opening ----------
     @classmethod
@@ -219,8 +222,9 @@ class Project:
         return Project.open(dest)
 
     def save_tracking(self) -> None:
-        _atomic_write(self.root / "tracking" / "tracking.json",
-                      json.dumps({"engine": self.data.get("engine"), "confidence": self.data["tracking"]["confidence"]}))
+        with self.lock:
+            text = json.dumps({"engine": self.data.get("engine"), "confidence": self.data["tracking"]["confidence"]})
+        _atomic_write(self.root / "tracking" / "tracking.json", text)
 
     def _load_tracking(self) -> None:
         f = self.root / "tracking" / "tracking.json"
@@ -238,24 +242,40 @@ class Project:
     def _marker(self) -> Path:
         return self.frames_dir / ".complete"
 
-    def cache_complete(self) -> bool:
+    def _marker_data(self) -> dict:
         try:
             m = json.loads(self._marker().read_text())
         except (OSError, ValueError):
-            return False
-        return m.get("w") == self.proxy[0] and m.get("h") == self.proxy[1] and m.get("count", 0) > 0
+            return {}
+        m.setdefault("first", 0)
+        m.setdefault("last", int(m.get("count", 0)) - 1)  # older projects stored only a count
+        return m
+
+    def cache_range(self) -> tuple[int, int]:
+        """The source frames that must be cached: the layer's trim range."""
+        wa = self.data["workArea"]
+        return int(wa["in"]), min(int(wa["out"]), self.n_frames - 1)
+
+    def cache_complete(self, rng: tuple[int, int] | None = None) -> bool:
+        a, b = rng or self.cache_range()
+        m = self._marker_data()
+        return bool(m) and m.get("w") == self.proxy[0] and m.get("h") == self.proxy[1] and m.get("count", 0) > 0 \
+            and m["first"] <= a and m["last"] >= b
 
     def cached_frame_count(self) -> int:
-        if self.cache_complete():
-            return json.loads(self._marker().read_text())["count"]
-        return sum(1 for _ in self.frames_dir.glob("*.jpg"))
+        a, b = self.cache_range()
+        return sum(1 for i in range(a, b + 1) if (self.frames_dir / f"{i:06d}.jpg").exists())
 
     def build_cache(self, job: Job | None = None) -> dict:
-        if self.cache_complete():
+        """Extract proxy frames for the trim range only (lazy: frames outside it decode on demand)."""
+        a, b = self.cache_range()
+        if self.cache_complete((a, b)):
             log.info("frame cache reused (%d frames)", self.cached_frame_count())
             return {"reused": True, "frames": self.cached_frame_count()}
         w, h = self.proxy
-        total = max(1, self.n_frames)
+        to_end = b >= self.n_frames - 1                    # the frame count of some files is only an estimate:
+        count = None if to_end else b - a + 1              # when we reach the end, let FFmpeg tell us the truth
+        total = max(1, b - a + 1)
 
         def prog(n: int) -> None:
             if job:
@@ -265,44 +285,47 @@ class Project:
 
         def extract() -> int:
             try:
-                return video.extract_proxy_frames(self.info, self.frames_dir, w, h, prog, (lambda: job.cancelled) if job else None)
+                return video.extract_proxy_frames(self.info, self.frames_dir, w, h, prog,
+                                                  (lambda: job.cancelled) if job else None, first=a, count=count)
             except InterruptedError:
                 raise Cancelled()
 
         try:
-            count = extract()
-            if count == 0:
+            got = extract()
+            if got == 0:
                 raise MediaError("No frames could be decoded.", stage="frame-extraction")
-        except MediaError as first:
+        except MediaError as first_err:
             if self.intermediate_path.exists():
                 raise
             # The source is valid (it probed fine) but could not be decoded in one pass: normalise it into a
             # stable constant-frame-rate intermediate and extract from that instead of calling the file corrupt.
-            log.warning("direct extraction failed (%s); transcoding to a stable intermediate", first.detail or first.message)
+            log.warning("direct extraction failed (%s); transcoding to a stable intermediate", first_err.detail or first_err.message)
             if job:
                 job.update(0.0, "Converting to a stable intermediate format")
+            full = max(1, self.n_frames)
             try:
                 video.make_intermediate(self._info or self.info, self.intermediate_path,
-                                        (lambda f: job.update(min(0.45, f / total * 0.45), f"Converting {f}/{total}")) if job else None,
+                                        (lambda f: job.update(min(0.45, f / full * 0.45), f"Converting {f}/{full}")) if job else None,
                                         (lambda: job.cancelled) if job else None)
             except InterruptedError:
                 raise Cancelled()
             except MediaError as e:
                 raise MediaError("This video could not be decoded.", e.hints, stage="transcode",
-                                 exit_code=e.exit_code, detail=e.detail or first.detail, log=e.log or first.log)
-            count = extract()
-            if count == 0:
-                raise first
-        if count > 0 and count != self.n_frames:
-            log.info("frame count corrected %d -> %d", self.n_frames, count)
+                                 exit_code=e.exit_code, detail=e.detail or first_err.detail, log=e.log or first_err.log)
+            got = extract()
+            if got == 0:
+                raise first_err
+        last = a + got - 1
+        if to_end and last != self.n_frames - 1:           # estimate was off: correct the clip length
+            log.info("frame count corrected %d -> %d", self.n_frames, last + 1)
             wa = self.data["workArea"]
-            if wa["out"] >= self.n_frames - 1 or wa["out"] >= count:
-                wa["out"] = count - 1
-            self.meta["frame_count"] = count
-            self.meta["duration"] = count / self.fps
+            if wa["out"] >= self.n_frames - 1 or wa["out"] > last:
+                wa["out"] = last
+            self.meta["frame_count"] = last + 1
+            self.meta["duration"] = (last + 1) / self.fps
             self.touch()
-        self._marker().write_text(json.dumps({"count": count, "w": w, "h": h}))
-        return {"reused": False, "frames": count}
+        self._marker().write_text(json.dumps({"first": a, "last": last, "count": got, "w": w, "h": h}))
+        return {"reused": False, "frames": got}
 
     def frame_bgr(self, i: int) -> np.ndarray:
         """Proxy-resolution frame: from the disk cache, else decoded on demand (lazy loading)."""
@@ -325,14 +348,17 @@ class Project:
 
     # ---------- public state ----------
     def public_state(self) -> dict:
-        d = copy.deepcopy(self.data)
+        with self.lock:
+            d = copy.deepcopy(self.data)
         d["root"] = str(self.root)
         d["recovered"] = self.recovered
         d["proxy"] = {"width": self.proxy[0], "height": self.proxy[1]}
         return d
 
     def timeline(self, low: float) -> dict:
-        conf = {int(k): v for k, v in self.data["tracking"]["confidence"].items()}
+        with self.lock:
+            conf = {int(k): v for k, v in self.data["tracking"]["confidence"].items()}
+            keyframes = copy.deepcopy(self.data["keyframes"])
         frames = self.masks.frames()
         ranges: list[list[int]] = []
         for f in frames:
@@ -341,8 +367,9 @@ class Project:
             else:
                 ranges.append([f, f])
         return {
-            "n_frames": self.n_frames, "keyframes": self.data["keyframes"], "confidence": conf,
+            "n_frames": self.n_frames, "keyframes": keyframes, "confidence": conf,
             "warnings": sorted(f for f, c in conf.items() if c < low), "masked": ranges,
-            "cache": {"frames": self.cached_frame_count(), "complete": self.cache_complete()},
+            "cache": {"frames": self.cached_frame_count(), "complete": self.cache_complete(),
+                      "needed": self.cache_range()[1] - self.cache_range()[0] + 1},
             "can_undo": self.masks.can_undo(), "can_redo": self.masks.can_redo(),
         }

@@ -18,6 +18,7 @@ DEFAULT_MATTE: dict[str, Any] = {
     "shift": 0.0,         # px    +expand / -contract
     "decontaminate": True,
     "temporal": 0.4,      # 0..1  temporal stabilisation strength
+    "hardEdge": True,     # crisp 1-px edge, no feather. Softness is only what the user adds with `feather`.
 }
 
 
@@ -67,6 +68,8 @@ def refine_alpha(alpha_u8: np.ndarray, frame_bgr: np.ndarray, s: dict, scale: fl
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
         band = (cv2.dilate(hard, k) - cv2.erode(hard, k)) > 0
         a = np.where(band, a * (1 - er) + gf * er, a)
+    if s.get("hardEdge", True):  # snap the transition to ~1 px: the contour is exactly where the matte says, never fuzzy
+        a = np.clip((a - 0.5) * 8.0 + 0.5, 0, 1)
     f = float(s["feather"]) * scale
     if f > 0.2:
         a = cv2.GaussianBlur(a, (0, 0), f)

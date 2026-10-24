@@ -116,7 +116,8 @@ def _clean(mask: np.ndarray, keep_points: list[tuple[float, float]] | None = Non
 
 
 def _soften(mask: np.ndarray) -> np.ndarray:
-    return cv2.GaussianBlur(mask, (0, 0), 0.9)
+    """Name kept for history: it now HARDENS. Detected masks are crisp 0/255 (no blur); softness is the user's choice."""
+    return np.where(mask > 127, 255, 0).astype(np.uint8)
 
 
 def grabcut_box(bgr: np.ndarray, box: tuple[int, int, int, int], iters: int = 4, max_side: int = 640) -> np.ndarray:

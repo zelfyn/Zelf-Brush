@@ -231,14 +231,16 @@ def read_frames(info: VideoInfo, w: int, h: int, start: int = 0, count: int | No
 
 def extract_proxy_frames(info: VideoInfo, out_dir: Path, w: int, h: int,
                          on_progress: Callable[[int], None] | None = None,
-                         cancelled: Callable[[], bool] | None = None) -> int:
-    """Extract every frame as a proxy JPEG (000000.jpg ...). Returns the frame count."""
+                         cancelled: Callable[[], bool] | None = None,
+                         first: int = 0, count: int | None = None) -> int:
+    """Extract proxy JPEGs for source frames first..first+count-1 (all the way to the end when count is None).
+    Files are named by SOURCE frame index (000123.jpg). Returns how many frames were written."""
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("*.jpg"):
         old.unlink()
     pattern = str(out_dir / "%06d.jpg")
-    base = [binary("ffmpeg"), "-v", "error", "-nostats", "-progress", "pipe:1", "-i", info.path]
-    tail = ["-vf", f"scale={w}:{h}", "-q:v", "3", "-start_number", "0", pattern]
+    base = [binary("ffmpeg"), "-v", "error", "-nostats", "-progress", "pipe:1", *_seek(info, first), "-i", info.path]
+    tail = ["-vf", f"scale={w}:{h}", *(["-frames:v", str(count)] if count else []), "-q:v", "3", "-start_number", str(first), pattern]
     for sync in (["-fps_mode", "passthrough"], ["-vsync", "0"]):
         err = tempfile.TemporaryFile()
         proc = subprocess.Popen(base + sync + tail, stdout=subprocess.PIPE, stderr=err, text=True, encoding="utf-8", errors="replace",
@@ -266,6 +268,37 @@ def extract_proxy_frames(info: VideoInfo, out_dir: Path, w: int, h: int,
             raise MediaError("Frames could not be extracted from this video.",
                              ["The file may be damaged", "See ffmpeg.log for details"])
     return len(list(out_dir.glob("*.jpg")))
+
+
+_probe_cache: dict[tuple[str, float], VideoInfo] = {}
+
+
+def probe_cached(path: str | Path) -> VideoInfo:
+    """probe() with a tiny cache keyed by path + mtime (the import dialog asks for many preview frames of one file)."""
+    p = Path(path)
+    key = (str(p), p.stat().st_mtime if p.exists() else 0.0)
+    if key not in _probe_cache:
+        if len(_probe_cache) > 16:
+            _probe_cache.clear()
+        _probe_cache[key] = probe(p)
+    return _probe_cache[key]
+
+
+def preview_jpeg(path: str | Path, index: int, width: int = 640) -> bytes:
+    """One frame of a not-yet-imported video as JPEG, for the import dialog."""
+    import cv2
+
+    info = probe_cached(path)
+    index = max(0, min(index, info.frame_count - 1))
+    w = max(64, min(width, info.width))
+    h = max(2, int(round(w * info.height / info.width / 2)) * 2)
+    img = decode_frame(info, index, w, h)
+    if img is None:
+        raise MediaError("That frame could not be decoded.", ["The video may be damaged near this point"], stage="preview")
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise MediaError("The preview could not be encoded.", stage="preview")
+    return buf.tobytes()
 
 
 def make_intermediate(info: VideoInfo, out: Path, on_progress: Callable[[int], None] | None = None,

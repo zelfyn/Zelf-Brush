@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { AppError, CompState, EngineInfo, GpuInfo, Job, ObjectInfo, ProjectState, Timeline, Tool, ViewMode } from "./types";
+import type { AppError, AutoUpdateSettings, CompState, EngineInfo, GpuInfo, ImportDraft, Job, ObjectInfo, ProjectState, Timeline, Tool, ViewMode } from "./types";
 
 export interface AppState {
   ready: boolean;
@@ -30,17 +30,31 @@ export interface AppState {
   exportKind: "mp4" | "mov-alpha" | "after-effects" | "depth";
   queueOpen: boolean;
   busy: string | null;
+  importDraft: ImportDraft | null;
+  autoUpdate: AutoUpdateSettings;
+  aiPending: number;
   dropActive: boolean;
+}
+
+function loadAutoUpdate(): AutoUpdateSettings {
+  try {
+    const raw = JSON.parse(localStorage.getItem("zelfbrush.autoUpdate") ?? "null") as Partial<AutoUpdateSettings> | null;
+    if (raw) return { enabled: raw.enabled ?? true, forward: Math.max(0, raw.forward ?? 30), backward: Math.max(0, raw.backward ?? 0) };
+  } catch {
+    /* storage unavailable: use defaults */
+  }
+  return { enabled: true, forward: 30, backward: 0 };
 }
 
 const initial: AppState = {
   ready: false, project: null, comp: null, timeline: null, frame: 0, displayedFrame: -1, playing: false,
-  tool: "brush", viewMode: "overlay", previewQuality: 100,
-  brush: { size: 40, hardness: 0.7, strength: 1 },
+  tool: "brush", viewMode: "composite", previewQuality: 100,
+  brush: { size: 40, hardness: 1, strength: 1 },
   lasso: { mode: "add", shape: "freehand", aiRefine: true },
   objectMode: "add", renderKey: 0, detections: [], analysis: "idle", jobs: {},
   gpu: null, engines: [], activeEngine: "", engineProvider: "CPU", engineAccelerated: false, error: null, toast: null, dialog: null, exportKind: "mp4",
-  queueOpen: false, busy: null, dropActive: false,
+  queueOpen: false, busy: null, importDraft: null, aiPending: 0,
+  autoUpdate: loadAutoUpdate(), dropActive: false,
 };
 
 let state = initial;

@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,6 +105,21 @@ def decide_model(p_general: np.ndarray, p_anime: np.ndarray) -> str:
     return "anime" if a_a > 1.2 * max(a_g, 1e-6) and unc(p_anime) <= unc(p_general) + 0.03 else "general"
 
 
+_prio = threading.local()
+
+
+@contextlib.contextmanager
+def interactive():
+    """Mark this thread's AI calls as 'the user is waiting for this'. Background jobs yield to them, so a long tracking
+    run can never make a click, a lasso refine or a depth preview wait behind it."""
+    prev = getattr(_prio, "on", False)
+    _prio.on = True
+    try:
+        yield
+    finally:
+        _prio.on = prev
+
+
 class OrtRuntime:
     """One ONNX session. Prefers GPU providers; validates them with a warm-up run; falls back to CPU on any failure."""
 
@@ -113,6 +129,7 @@ class OrtRuntime:
         self.ort, self.model, self.lock = ort, model, threading.Lock()
         self.spec = spec or spec_for_path(model)
         self.fell_back, self.error = False, ""
+        self._waiting, self._wlock = 0, threading.Lock()   # interactive callers currently queued for this session
         avail = ort.get_available_providers()
         want = [] if (force_cpu or os.environ.get("ROTOBRUSH_FORCE_CPU")) else [p for p in GPU_PROVIDERS if p in avail]
         self.session = None
@@ -152,15 +169,27 @@ class OrtRuntime:
         return self.provider != "CPUExecutionProvider"
 
     def infer(self, x: np.ndarray) -> np.ndarray:
-        with self.lock:
-            try:
-                return self.session.run(None, {self.input_name: x})[0]
-            except Exception as e:  # noqa: BLE001
-                if not self.accelerated:
-                    raise
-                log.warning("GPU inference failed (%s); continuing on CPU", e)
-                self.session, self.fell_back = self._make(None), True
-                return self.session.run(None, {self.input_name: x})[0]
+        inter = getattr(_prio, "on", False)
+        if inter:
+            with self._wlock:
+                self._waiting += 1
+        else:
+            while self._waiting > 0:  # background work steps aside for anything the user is waiting on
+                time.sleep(0.004)
+        try:
+            with self.lock:
+                try:
+                    return self.session.run(None, {self.input_name: x})[0]
+                except Exception as e:  # noqa: BLE001
+                    if not self.accelerated:
+                        raise
+                    log.warning("GPU inference failed (%s); continuing on CPU", e)
+                    self.session, self.fell_back = self._make(None), True
+                    return self.session.run(None, {self.input_name: x})[0]
+        finally:
+            if inter:
+                with self._wlock:
+                    self._waiting -= 1
 
     def saliency(self, bgr: np.ndarray) -> np.ndarray:
         """Subject probability map (float32 0..1) at the input size. All zeros when nothing salient is present."""
@@ -258,8 +287,7 @@ class OnnxInteractive(InteractiveSegmentation):
         pb = b[y0:y1, x0:x1].astype(np.uint8)
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band + 1, 2 * band + 1))
         core, outer = cv2.erode(pb, k) > 0, cv2.dilate(pb, k) > 0
-        soft = np.clip((prob - 0.5) * 3.0 + 0.5, 0, 1)
-        alpha = np.where(core, 1.0, np.where(outer, soft, 0.0))
+        alpha = np.where(core, 1.0, np.where(outer, (prob > 0.5).astype(np.float32), 0.0))  # hard decision, no soft band
         if alpha.sum() < 0.5 * pb.sum():  # the network disagrees with the prior (subject not salient): use GrabCut instead
             return cvseg.grabcut_prior(bgr, prior, band)
         out = np.zeros((h, w), np.uint8)
@@ -351,18 +379,15 @@ class OnnxEngine(SegmentationEngine):
 
     @property
     def provider(self) -> str:  # type: ignore[override]
-        """Report the provider used by a loaded session, not merely an installed provider.
-
-        get_available_providers() only lists provider plugins bundled with ONNX Runtime; it
-        does not guarantee that a compatible GPU/device is present. DirectML can therefore
-        be listed on headless/virtual Windows machines even though session creation falls
-        back to CPU. Before the first model session is created, report CPU (the only provider
-        we can confirm is active) so `provider` and `accelerated` never contradict each other.
-        """
         rt = self._primary
-        if rt is None:
+        if rt is not None:
+            return {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}.get(rt.provider, "CPU")
+        try:
+            import onnxruntime as ort
+            av = ort.get_available_providers()
+            return "CUDA" if "CUDAExecutionProvider" in av else "DirectML" if "DmlExecutionProvider" in av else "CPU"
+        except Exception:  # noqa: BLE001
             return "CPU"
-        return {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}.get(rt.provider, "CPU")
 
     @property
     def accelerated(self) -> bool:  # type: ignore[override]

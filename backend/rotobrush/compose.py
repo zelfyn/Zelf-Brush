@@ -5,6 +5,8 @@ import json
 import logging
 import re
 import shutil
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterator
 
@@ -39,8 +41,33 @@ def mask_active(L: dict, p) -> bool:
     return bool(L.get("useMask", True)) and bool(p.masks.frames())
 
 
+_comp_cache: "OrderedDict[tuple, tuple[bytes, str]]" = OrderedDict()
+_comp_lock = threading.Lock()
+
+
+def _comp_signature(comp: Comp, frame: int, quality: int) -> tuple:
+    """Everything that can change the picture. Equal signature -> the cached bytes are exactly right."""
+    parts = []
+    for L in comp.data["layers"]:
+        p = comp.projects[L["id"]]
+        lf = comp.local_frame(L, frame) if L["visible"] else None
+        act = mask_active(L, p)
+        parts.append((L["id"], L["visible"], lf, p.masks.version(lf) if (lf is not None and act) else -1, act, L["opacity"],
+                      L["scale"], L["x"], L["y"], ops._settings_hash(p.data["maskSettings"])))
+    return (comp.width, comp.height, frame, quality, tuple(parts))
+
+
 def render_comp(comp: Comp, frame: int, quality: int) -> tuple[bytes, str]:
-    """Composite of every visible layer at one comp frame, at proxy resolution, as RGBA (transparent where empty)."""
+    """Composite of every visible layer at one comp frame (top layer wins), at proxy resolution.
+
+    Transparent where nothing covers the frame -> PNG with alpha. Fully opaque -> JPEG (several times faster to
+    encode and send, which matters for playback)."""
+    sig = _comp_signature(comp, frame, quality)
+    with _comp_lock:
+        hit = _comp_cache.get(sig)
+        if hit is not None:
+            _comp_cache.move_to_end(sig)
+            return hit
     pw, ph = proxy_size(comp.width, comp.height)
     sx = pw / comp.width
     C = np.zeros((ph, pw, 3), np.float32)
@@ -60,15 +87,29 @@ def render_comp(comp: Comp, frame: int, quality: int) -> tuple[bytes, str]:
         fg = cv2.resize(bgr, (dw, dh), interpolation=interp).astype(np.float32) / 255.0
         a = cv2.resize(alpha, (dw, dh), interpolation=cv2.INTER_LINEAR) * float(L["opacity"])
         _blend(C, A, fg, a, int(round((pw - dw) / 2 + L["x"] * sx)), int(round((ph - dh) / 2 + L["y"] * sx)))
-    out = np.empty((ph, pw, 4), np.uint8)
-    out[..., :3] = np.clip(C / np.maximum(A, 1e-4)[..., None] * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    out[..., 3] = np.clip(A * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    if quality < 100:
-        out = cv2.resize(out, None, fx=max(0.1, quality / 100.0), fy=max(0.1, quality / 100.0), interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".png", out, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    q = max(0.1, quality / 100.0) if quality < 100 else 1.0
+    if float(A.min()) >= 0.995:
+        img = np.clip(C * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        if q < 1.0:
+            img = cv2.resize(img, None, fx=q, fy=q, interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        mime = "image/jpeg"
+    else:
+        img = np.empty((ph, pw, 4), np.uint8)
+        img[..., :3] = np.clip(C / np.maximum(A, 1e-4)[..., None] * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        img[..., 3] = np.clip(A * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        if q < 1.0:
+            img = cv2.resize(img, None, fx=q, fy=q, interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        mime = "image/png"
     if not ok:
         raise MediaError("The composite could not be rendered.")
-    return buf.tobytes(), "image/png"
+    out = (buf.tobytes(), mime)
+    with _comp_lock:
+        _comp_cache[sig] = out
+        while len(_comp_cache) > 80:
+            _comp_cache.popitem(last=False)
+    return out
 
 
 def _entries(comp: Comp, a0: int, a1: int, scale: float) -> list[dict]:
@@ -106,6 +147,22 @@ def comp_audio(comp: Comp, entries: list[dict], a0: int, count: int) -> AudioArg
     pad = f"apad=whole_dur={count / comp.fps:.6f}"
     chains.append(f"{labels}{pad}[aout]" if len(aud) == 1 else f"{labels}amix=inputs={len(aud)}:duration=longest:normalize=0,{pad}[aout]")
     return inputs, ["-filter_complex", ";".join(chains), "-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+
+
+def _describe(comp: Comp, entries: list[dict]) -> dict:
+    """Structured [EXPORT] log lines: the composition, then the input details of every layer (top layer first, no suffix)."""
+    d = {"Composition": f"{comp.data['name']} ({len(entries)} layers, {comp.width}x{comp.height} @ {comp.fps:.3f})",
+         "Layers": ", ".join(e["L"]["name"] for e in entries)}
+    for k, e in enumerate(reversed(entries)):
+        p, sfx = e["p"], "" if k == 0 else f" {k + 1}"
+        inter = p.info.path
+        d.update({f"Input{sfx}": p.source_path,
+                  f"Input codec{sfx}": f"{p.meta.get('codec')} / audio {p.meta.get('audio_codec') or 'none'}",
+                  f"Input resolution{sfx}": f"{p.meta['width']}x{p.meta['height']}",
+                  f"Input FPS{sfx}": f"{p.fps:.3f}",
+                  f"Input duration{sfx}": f"{p.meta['duration']:.2f}s",
+                  f"Intermediate path{sfx}": inter if inter != p.source_path else "none (decoding original)"})
+    return d
 
 
 def export_comp(comp: Comp, kind: str, s: dict, out_path: str | Path, job: Job | None = None,
@@ -182,8 +239,7 @@ def export_comp(comp: Comp, kind: str, s: dict, out_path: str | Path, job: Job |
         plans, pix_in, audio = [(codec, list(MOV_CODECS[codec][0]))], "bgra", None
     return run_export(final, kind, (W, H), comp.fps, count, pix_in, plans, audio, source, job, span,
                       s.get("movCodec", "prores4444"),
-                      describe={"Composition": f"{comp.data['name']} ({len(entries)} layers, {comp.width}x{comp.height} @ {comp.fps:.3f})",
-                                "Layers": ", ".join(e["L"]["name"] for e in entries)})
+                      describe=_describe(comp, entries))
 
 
 # ------------------------------------------------------------------ depth map export

@@ -8,18 +8,38 @@ Import → (Trim) → Detect subject → Auto roto → Brush / Eraser / Lasso / 
                  └─ stack more videos as layers, like an After Effects timeline
 ```
 
+## Importing: cut first, then add to the timeline
+Choosing or dropping a video opens the **Import video** dialog before anything reaches the timeline: a preview with a
+scrubber, **Start (In) / End (Out)** sliders to cut the clip, a layer name, the AI model, and — when a project is open —
+whether it becomes a **new layer** (and at which frame) or replaces the project. Only the part you keep is cached and
+processed; the rest of the file is never touched.
+
 ## Working with layers (timeline like After Effects)
-- **File → Add video as layer…** (or drop a video while a project is open) puts a new layer on top, starting at the playhead.
-  **File → New project from video…** starts over. The composition takes its size and frame rate from the first video.
-- Each layer is its own clip: own roto masks, tracking, matte settings and AI model. Click a layer (left list or its bar) to
-  select it; the roto tools always work on the selected layer.
-- **Trim before roto:** drag the left/right end of a layer bar, use *Trim start here / Trim end here* (Alt+[ and Alt+]), or
-  *Reset trim*. Auto roto, tracking and exports then only touch the part you kept. **Drag the bar** to move it in time.
+- The main view is the **Composite**: every visible layer stacked, top layer in front, each with its roto matte. It is what
+  you see while editing, scrubbing and playing. The roto tools act on the **selected layer** right inside that view (a click is
+  mapped through the layer's scale and position). *Original / Mask / Overlay / Problem areas / Depth* show the selected layer alone.
+- **File → Add video as layer…** (or drop a video while a project is open) puts a new layer on top. **File → New project from
+  video…** starts over. The composition takes its size and frame rate from the first video.
+- Each layer is its own clip: own roto masks, tracking, matte settings and AI model. Click a layer (left list or its bar).
+- **Trim:** drag the ends of a layer bar, or *Trim start here / Trim end here* (Alt+[ and Alt+]), or *Reset trim*. Roto, tracking and
+  export then only touch the part you kept. **Drag the bar** to move it in time.
 - Eye button = show/hide, ▲▼ = stacking order, panel = opacity, scale, position, *Apply roto matte*.
-- **Composite** view (key C) shows the whole stack; **Original / Mask / Overlay…** show the selected layer for editing.
-- Export (MP4, MOV alpha, After Effects, Depth) renders the stack top-to-bottom with each layer's roto matte; audio of
-  visible layers is mixed. Layers with a different frame rate are resampled to the composition's.
+- Export (MP4, MOV alpha, After Effects, Depth) renders the stack top-to-bottom with each layer's matte; audio of visible
+  layers is mixed. Layers with a different frame rate are resampled to the composition's.
 - The composition work area (ruler handles, keys I / P) limits exports. Removing a layer never deletes its files.
+
+## Edges: crisp by default
+Detected mattes have a hard, 1-pixel edge — no automatic feather. *Matte → Feather* is the only thing that softens an edge, and only
+as much as you set. (*Hard edges* can be switched off to get the older, softer matte.) New brushes default to 100 % hardness.
+
+## AI after you edit — without lag
+Edits (Brush, Eraser, Lasso, Object) are applied instantly. About a second after you stop, the AI carries the correction to the
+neighbouring frames **in the background** (*Current frame → Update nearby frames*: forward / backward range, default 30 / 0).
+- It stops the moment you edit again, never overwrites a frame you corrected yourself, and one **Ctrl+Z** undoes your edit *and*
+  everything derived from it.
+- A Lasso is applied instantly as drawn; snapping it to the real edges follows in the background.
+- Anything you are waiting for (Object tool, depth preview) is served before background work, and no tracking job holds a lock on
+  the project any more, so previews and the timeline stay responsive while the AI works. The *AI* chip above the viewport shows activity.
 
 ## Depth maps
 Select a layer → *Depth map → Preview depth* (key D), or **Export → Depth map…**. Model: Depth Anything V2 Small on the GPU.

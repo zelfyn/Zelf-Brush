@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "../api";
-import { activeLayer, cancelJob, clearFrameMask, deleteLayer, patchLayer, propagate, runAnalysis, setAiModel, setEngine, setMatte, startAutoRoto, toggleObject, trimActive } from "../actions";
+import { activeLayer, cancelJob, clearFrameMask, deleteLayer, patchLayer, propagate, runAnalysis, setAiModel, setAutoUpdate, setEngine, setMatte, startAutoRoto, toggleObject, trimActive } from "../actions";
 import { store, useApp } from "../store";
 import type { MatteSettings } from "../types";
 
@@ -65,6 +65,7 @@ export function Properties() {
   const engines = useApp((s) => s.engines);
   const engine = useApp((s) => s.activeEngine);
   const layer = activeLayer();
+  const au = useApp((s) => s.autoUpdate);
   const running = Object.values(jobs).filter((j) => j.lane === "process" && (j.status === "running" || j.status === "waiting"));
 
   if (!project) {
@@ -158,11 +159,12 @@ export function Properties() {
         <Slider label="Edge refine" value={ms.edgeRefine} min={0} max={1} step={0.05} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setMatte({ edgeRefine: v })} />
         <Slider label="Detail" value={ms.detail} min={0} max={1} step={0.05} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setMatte({ detail: v })} />
         <Slider label="Smooth" value={ms.smooth} min={0} max={1} step={0.05} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setMatte({ smooth: v })} />
+        <label className="chk"><input type="checkbox" checked={ms.hardEdge} onChange={(e) => setMatte({ hardEdge: e.target.checked })} />Hard edges (no feather)</label>
         <Slider label="Feather" value={ms.feather} min={0} max={30} step={0.5} fmt={(v) => `${v}px`} onChange={(v) => setMatte({ feather: v })} />
         <Slider label="Expand / contract" value={ms.shift} min={-30} max={30} step={1} fmt={(v) => `${v > 0 ? "+" : ""}${v}`} onChange={(v) => setMatte({ shift: v })} />
         <Slider label="Stabilise" value={ms.temporal} min={0} max={1} step={0.05} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setMatte({ temporal: v })} />
         <label className="chk"><input type="checkbox" checked={ms.decontaminate} onChange={(e) => setMatte({ decontaminate: e.target.checked })} />Remove background colour from edges</label>
-        <p className="hint">Matte settings never change the stored masks. Stabilise is applied on export.</p>
+        <p className="hint">Edges are crisp by default. Feather is only what you add here. Settings never change the stored masks.</p>
       </div>
 
       <div className="sec">
@@ -175,6 +177,14 @@ export function Properties() {
           <button onClick={() => void clearFrameMask()}>Clear mask</button>
         </div>
         <p className="hint">Propagation stops at the next frame you corrected yourself.</p>
+        <label className="chk" style={{ marginTop: 10 }}><input type="checkbox" checked={au.enabled} onChange={(e) => setAutoUpdate({ enabled: e.target.checked })} />Update nearby frames with AI after each edit</label>
+        {au.enabled && (
+          <>
+            <Slider label="Forward" value={au.forward} min={0} max={120} step={1} fmt={(v) => `${v} fr`} onChange={(v) => setAutoUpdate({ forward: v })} />
+            <Slider label="Backward" value={au.backward} min={0} max={120} step={1} fmt={(v) => `${v} fr`} onChange={(v) => setAutoUpdate({ backward: v })} />
+          </>
+        )}
+        <p className="hint">Runs in the background about a second after you stop editing, and stops the moment you edit again. Your own corrected frames are never overwritten.</p>
       </div>
 
       <div className="sec">

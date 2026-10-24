@@ -29,7 +29,7 @@ export function StatusBar() {
           : gpu?.detected ? <>GPU: <b>{gpu.name}</b> · AI running on CPU</> : "No NVIDIA GPU detected · CPU mode"}
       </span>
       <span>Engine: <b>{engine}</b></span>
-      {tl && <span>Cache: <b className="num">{tl.cache.frames}/{tl.n_frames}</b>{tl.cache.complete ? "" : " …"}</span>}
+      {tl && <span>Cache: <b className="num">{tl.cache.frames}/{tl.cache.needed ?? tl.n_frames}</b>{tl.cache.complete ? "" : " …"}</span>}
       <span className="spacer" />
       {job && <span>{job.title}: {job.message} <span className="bar"><i style={{ width: `${job.progress * 100}%` }} /></span></span>}
       <button onClick={() => import("../store").then((m) => m.store.set({ queueOpen: !open }))}>Queue</button>

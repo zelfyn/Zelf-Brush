@@ -33,7 +33,7 @@ class MaskStore:
         self._ver: dict[int, int] = {}
         self._undo: list[Op] = []
         self._redo: list[Op] = []
-        self._op: Op | None = None
+        self._tl = threading.local()              # the current operation is per thread: a background job never mixes with UI edits
         self._lock = threading.RLock()
         self._present = {int(p.stem) for p in self.dir.glob("*.png") if p.stem.isdigit()}
 
@@ -86,8 +86,9 @@ class MaskStore:
     def set(self, i: int, arr: np.ndarray) -> None:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
         with self._lock:
-            if self._op is not None and i not in self._op.touched:
-                self._op.touched[i] = self._raw(i)
+            op = getattr(self._tl, "op", None)
+            if op is not None and i not in op.touched:
+                op.touched[i] = self._raw(i)
             ok, buf = cv2.imencode(".png", arr)
             if not ok:
                 raise RuntimeError("PNG encode failed")
@@ -96,22 +97,33 @@ class MaskStore:
 
     def delete(self, i: int) -> None:
         with self._lock:
-            if self._op is not None and i not in self._op.touched:
-                self._op.touched[i] = self._raw(i)
+            op = getattr(self._tl, "op", None)
+            if op is not None and i not in op.touched:
+                op.touched[i] = self._raw(i)
             self._write_bytes(i, None)
 
     @contextmanager
-    def operation(self, label: str) -> Iterator[Op]:
+    def operation(self, label: str, merge: bool = False) -> Iterator[Op]:
+        """Group mask writes into one undo step. The lock is NOT held while the body runs (a tracking job can take
+        minutes; previews and edits must keep working). merge=True folds the changes into the previous undo step when
+        that is still the latest one, so 'edit + automatic update' undoes in a single press."""
         with self._lock:
+            top = self._undo[-1] if (merge and self._undo) else None
             op = Op(label, copy.deepcopy(self._get_meta()))
-            self._op = op
-            try:
-                yield op
-            finally:
-                self._op = None
-                if op.touched:
-                    self._undo.append(op)
-                    del self._undo[: -self.max_ops]
+        prev = getattr(self._tl, "op", None)
+        self._tl.op = op
+        try:
+            yield op
+        finally:
+            self._tl.op = prev
+            if op.touched:
+                with self._lock:
+                    if top is not None and self._undo and self._undo[-1] is top:
+                        for i, before in op.touched.items():
+                            top.touched.setdefault(i, before)       # keep the EARLIEST state of each frame
+                    else:
+                        self._undo.append(op)
+                        del self._undo[: -self.max_ops]
                     self._redo.clear()
 
     def _swap(self, src: list[Op], dst: list[Op]) -> tuple[str, list[int]] | None:

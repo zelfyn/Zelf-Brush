@@ -121,3 +121,18 @@ label.chk { display: flex; align-items: center; gap: 6px; margin: 5px 0; }
 .tlcell canvas { display: block; }
 
 .row input[type=number], .row input[type=text] { min-width: 0; width: 100%; }
+
+/* --- import dialog --- */
+.dialog.wide { width: 640px; }
+.previewbox { position: relative; background: #000; border-radius: 6px; overflow: hidden; aspect-ratio: 16 / 9; display: grid; place-items: center; margin-bottom: 10px; }
+.previewbox img { max-width: 100%; max-height: 100%; display: block; }
+.previewbusy { position: absolute; right: 8px; top: 6px; color: var(--dim); }
+.field.slim { grid-template-columns: 90px 1fr; margin: 6px 0; }
+.tcl { min-width: 96px; text-align: right; color: var(--dim); }
+.keepline { margin: 2px 0 10px 100px; }
+
+/* --- AI activity chip --- */
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 10px; background: var(--accent-bg); color: #cfe3ff; border: 1px solid #36608f; font-size: 12px; }
+.chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.chip button { padding: 0 6px; font-size: 11px; border-radius: 8px; }
+@media (prefers-reduced-motion: no-preference) { .chip i { animation: pulse 1s ease-in-out infinite; } @keyframes pulse { 50% { opacity: .25; } } }

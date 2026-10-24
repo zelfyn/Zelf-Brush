@@ -31,13 +31,15 @@ class Job:
     error: dict | None = None
     result: dict = field(default_factory=dict)
     cancel_flag: threading.Event = field(default_factory=threading.Event)
+    group: str | None = None                      # e.g. the layer a background job belongs to
+    finished: threading.Event = field(default_factory=threading.Event)
     _last_pub: float = 0.0
 
     def public(self) -> dict:
         return {
             "id": self.id, "lane": self.lane, "kind": self.kind, "title": self.title,
             "status": self.status, "progress": round(self.progress, 4), "message": self.message,
-            "output": self.output, "error": self.error, "result": self.result,
+            "output": self.output, "error": self.error, "result": self.result, "group": self.group,
         }
 
     def update(self, progress: float | None = None, message: str | None = None, force: bool = False) -> None:
@@ -62,7 +64,7 @@ class Job:
 
 
 class JobManager:
-    LANES = ("cache", "process", "export")
+    LANES = ("cache", "process", "export", "auto")  # "auto" = background AI updates, never blocks the others
 
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
@@ -73,8 +75,8 @@ class JobManager:
             self._queues[lane] = q
             threading.Thread(target=self._worker, args=(lane, q), daemon=True, name=f"job-{lane}").start()
 
-    def submit(self, lane: str, kind: str, title: str, fn: Callable[[Job], Any]) -> Job:
-        job = Job(id=uuid.uuid4().hex[:10], lane=lane, kind=kind, title=title)
+    def submit(self, lane: str, kind: str, title: str, fn: Callable[[Job], Any], group: str | None = None) -> Job:
+        job = Job(id=uuid.uuid4().hex[:10], lane=lane, kind=kind, title=title, group=group)
         with self._lock:
             self.jobs[job.id] = job
         self._queues[lane].put((job, fn))
@@ -86,6 +88,7 @@ class JobManager:
             job, fn = q.get()
             if job.cancelled:
                 job.status = "cancelled"
+                job.finished.set()
                 job.publish()
                 continue
             job.status = "running"
@@ -105,6 +108,7 @@ class JobManager:
                              "stage": getattr(e, "stage", None), "exit_code": getattr(e, "exit_code", None),
                              "detail": getattr(e, "detail", None), "log": getattr(e, "log", None)}
                 job.status = "failed"
+            job.finished.set()
             job.publish()
             bus.publish("job_finished", job=job.public())
 
@@ -117,6 +121,17 @@ class JobManager:
             job.status = "cancelled"
             job.publish()
         return True
+
+    def cancel_group(self, kinds: tuple[str, ...], group: str, wait: float = 1.5) -> int:
+        """Cancel this group's background jobs and wait (briefly) until they have really stopped, so they can never
+        overwrite an edit the user is about to make. Returns how many were cancelled."""
+        hit = [x for x in list(self.jobs.values()) if x.group == group and x.kind in kinds and x.status in ("waiting", "running")]
+        for x in hit:
+            self.cancel(x.id)
+        deadline = time.time() + wait
+        for x in hit:
+            x.finished.wait(max(0.0, deadline - time.time()))
+        return len(hit)
 
     def list(self) -> list[dict]:
         return [j.public() for j in self.jobs.values()][-50:]

@@ -39,7 +39,8 @@ class Comp:
 
     # ------------------------------------------------------------------ construction
     @classmethod
-    def create(cls, info: VideoInfo, workspace: Path, name: str | None = None) -> "Comp":
+    def create(cls, info: VideoInfo, workspace: Path, name: str | None = None, trim: tuple[int, int] | None = None,
+               layer_name: str | None = None, ai_model: str | None = None) -> "Comp":
         base = re.sub(r"[^\w\- ]+", "_", name or Path(info.filename).stem).strip() or "Untitled"
         root, n = workspace / base, 1
         while root.exists():
@@ -52,7 +53,7 @@ class Comp:
             "layers": [], "active": None, "exportSettings": dict(DEFAULT_EXPORT), "workArea": None,
         }
         comp = cls(root, data, {})
-        comp.add_layer(info, start=0)
+        comp.add_layer(info, start=0, name=layer_name, trim=trim, ai_model=ai_model)
         return comp
 
     @classmethod
@@ -89,17 +90,25 @@ class Comp:
             n += 1
         return f"L{n}"
 
-    def add_layer(self, info: VideoInfo, start: int | None = None, name: str | None = None) -> str:
+    def add_layer(self, info: VideoInfo, start: int | None = None, name: str | None = None,
+                  trim: tuple[int, int] | None = None, ai_model: str | None = None) -> str:
+        """`trim` = (first, last) source frames to keep (cut chosen in the import dialog). Only that range is cached."""
         with self.lock:
             lid = self._new_id()
             proj = Project.create(info, self.root / "layers", name=lid)
-            display = name or info.filename
+            display = (name or "").strip() or info.filename
             proj.data["project"]["name"] = display
-            proj.save()
+            if ai_model in ("auto", "general", "anime", "fast"):
+                proj.data["aiModel"] = ai_model
             n = proj.n_frames
+            a, b = (0, n - 1) if trim is None else (max(0, min(int(trim[0]), n - 1)), max(0, min(int(trim[1]), n - 1)))
+            if a > b:
+                raise MediaError("The In point must come before the Out point.", stage="trim")
             first = not self.data["layers"]
-            L = {"id": lid, "name": display, "dir": f"layers/{lid}", "start": int(start or 0), "trimIn": 0,
-                 "trimOut": n - 1, **LAYER_DEFAULTS}
+            L = {"id": lid, "name": display, "dir": f"layers/{lid}", "start": int(start or 0), "trimIn": a,
+                 "trimOut": b, **LAYER_DEFAULTS}
+            proj.data["workArea"] = {"in": a, "out": b}
+            proj.save()
             self.data["layers"].insert(0, L)  # new layers go on top, like After Effects
             self.projects[lid] = proj
             self.data["active"] = lid

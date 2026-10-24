@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { openLog } from "./api";
 import { boot, browseVideo, importFile, openProject, redo, saveProject, saveProjectAs, setCompWorkArea, setFrame, startPlaybackLoop, stepFrame, togglePlay, trimActive, undo } from "./actions";
 import { ExportDialog } from "./components/ExportDialog";
+import { ImportDialog } from "./components/ImportDialog";
 import { MenuBar } from "./components/MenuBar";
 import { Properties } from "./components/Properties";
 import { QueuePanel } from "./components/QueuePanel";
@@ -71,6 +72,7 @@ export function App() {
       <Timeline />
       <StatusBar />
       {dialog === "export" && project && <ExportDialog />}
+      <ImportDialog />
       {queueOpen && <QueuePanel />}
       {toast && <div className="toast" role="status">{toast}</div>}
       {!ready && !error && <div className="scrim"><div className="dialog"><h2>Starting Zelf-Brush…</h2><p className="hint">Waiting for the processing backend.</p></div></div>}

@@ -9,6 +9,7 @@ export interface MatteSettings {
   shift: number;
   decontaminate: boolean;
   temporal: number;
+  hardEdge: boolean;
 }
 
 export interface ExportSettings {
@@ -78,14 +79,14 @@ export interface Timeline {
   confidence: Record<string, number>;
   warnings: number[];
   masked: [number, number][];
-  cache: { frames: number; complete: boolean };
+  cache: { frames: number; complete: boolean; needed?: number };
   can_undo: boolean;
   can_redo: boolean;
 }
 
 export interface Job {
   id: string;
-  lane: "cache" | "process" | "export";
+  lane: "cache" | "process" | "export" | "auto";
   kind: string;
   title: string;
   status: "waiting" | "running" | "completed" | "failed" | "cancelled";
@@ -127,4 +128,21 @@ export interface AppError {
   exit_code?: number | null;
   detail?: string | null;
   log?: string | null;
+}
+
+export interface VideoProbe {
+  path: string; filename: string; width: number; height: number; fps: number; frame_count: number;
+  duration: number; codec: string; size_bytes: number; has_audio: boolean; audio_codec: string; container: string;
+}
+
+export interface ImportDraft {
+  path: string;
+  info: VideoProbe;
+  preferLayer: boolean;
+}
+
+export interface AutoUpdateSettings {
+  enabled: boolean;
+  forward: number;
+  backward: number;
 }

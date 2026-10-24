@@ -1,7 +1,7 @@
 import * as api from "./api";
 import { ApiError, inTauri } from "./api";
 import { store } from "./store";
-import type { CompState, ExportSettings, Job, Layer, MatteSettings, ObjectInfo, ProjectState, SystemStatus, Timeline } from "./types";
+import type { AutoUpdateSettings, CompState, ExportSettings, Job, Layer, MatteSettings, ObjectInfo, ProjectState, SystemStatus, Timeline, VideoProbe } from "./types";
 
 const VIDEO_EXT = /\.(mp4|mkv|mov)$/i;
 
@@ -108,7 +108,7 @@ export async function boot(): Promise<void> {
       else if (t === "drop") {
         store.set({ dropActive: false });
         const path = ev.payload.paths.find((p: string) => VIDEO_EXT.test(p));
-        if (path) void droppedPath(path);
+        if (path) void beginImport(path);
         else showError(new ApiError("That file type is not supported.", ["Drop an .mp4, .mkv or .mov file"]));
       }
     });
@@ -146,6 +146,7 @@ function handleEvent(ev: { type: string; [k: string]: unknown }): void {
         void refreshProject();
         if (job.status === "completed") toast(job.kind === "auto-roto" ? "Auto roto finished" : "Tracking finished");
       }
+      if (job.lane === "auto") refreshSoon();           // silent: the picture and timeline catch up, no toasts
       if (job.lane === "export" && job.status === "completed") {
         const w = (job.result.warnings as string[] | undefined) ?? [];
         toast(w.length ? `Export completed with a warning: ${w[0]}` : "Export completed successfully.");
@@ -171,51 +172,64 @@ async function openState(p: ProjectState): Promise<void> {
   if (p.recovered) toast("Recovered unsaved changes from autosave");
 }
 
-/** New project from one video. */
-export async function importPath(path: string): Promise<void> {
+export interface ImportOptions {
+  name: string;
+  trimIn: number;
+  trimOut: number;
+  asLayer: boolean;
+  start: number;
+  autoRoto: boolean;
+  aiModel: string;
+}
+
+/** Step 1 of every import: read the video's metadata and open the import dialog (nothing is imported yet). */
+export async function beginImport(path: string, preferLayer?: boolean): Promise<void> {
   store.set({ busy: "Reading video…" });
-  const p = await guard(() => api.post<ProjectState>("/video/import", { path }));
+  const info = await guard(() => api.post<VideoProbe>("/video/probe", { path }));
   store.set({ busy: null });
-  if (!p) return;
-  await openState(p);
-  await runAnalysis(true);
+  if (info) store.set({ importDraft: { path, info, preferLayer: preferLayer ?? !!store.get().comp } });
 }
 
-/** Add a video as a new layer on top of the stack, starting at the playhead. */
-export async function addLayerPath(path: string): Promise<void> {
-  const start = store.get().frame;
-  store.set({ busy: "Adding layer…" });
-  const p = await guard(() => api.post<ProjectState>("/layers/add", { path, start }));
-  store.set({ busy: null });
-  if (!p) return;
-  applyState(p);
-  store.set({ detections: p.objects, analysis: "idle", renderKey: store.get().renderKey + 1 });
-  await refreshTimeline();
-  toast(`Layer added at frame ${start}`);
-}
-
-/** Dropping a video adds a layer when a project is open (like After Effects), otherwise starts a new project. */
-export const droppedPath = (path: string): Promise<void> => (store.get().comp ? addLayerPath(path) : importPath(path));
-
-export async function importFile(file: File): Promise<void> {
+/** Browser dev mode: upload the file so the dialog can preview it (the desktop app passes real paths instead). */
+export async function stageFile(file: File): Promise<void> {
   if (!VIDEO_EXT.test(file.name)) {
     showError(new ApiError("That file type is not supported.", ["Drop an .mp4, .mkv or .mov file"]));
     return;
   }
-  const asLayer = !!store.get().comp;
   store.set({ busy: "Uploading video…" });
-  const p = await guard(() => api.upload<ProjectState>("/video/upload", file, { as_layer: asLayer ? "true" : "false" }));
+  const r = await guard(() => api.upload<{ path: string; info: VideoProbe }>("/video/stage", file));
   store.set({ busy: null });
-  if (!p) return;
-  if (asLayer) {
-    applyState(p);
-    store.set({ detections: p.objects, analysis: "idle", renderKey: store.get().renderKey + 1 });
-    await refreshTimeline();
-  } else {
-    await openState(p);
-    await runAnalysis(true);
-  }
+  if (r) store.set({ importDraft: { path: r.path, info: r.info, preferLayer: !!store.get().comp } });
 }
+
+/** Step 2: the user pressed "Add to timeline" in the dialog. */
+export async function confirmImport(o: ImportOptions): Promise<void> {
+  const d = store.get().importDraft;
+  if (!d) return;
+  store.set({ importDraft: null, busy: "Importing…" });
+  const body = { path: d.path, trimIn: o.trimIn, trimOut: o.trimOut, name: o.name, aiModel: o.aiModel };
+  if (o.asLayer && store.get().comp) {
+    const p = await guard(() => api.post<ProjectState>("/layers/add", { ...body, start: o.start }));
+    store.set({ busy: null });
+    if (!p) return;
+    applyState(p);
+    store.set({ detections: p.objects, analysis: "idle", frame: o.start, renderKey: store.get().renderKey + 1 });
+    await refreshTimeline();
+    toast(`Layer added at frame ${o.start}`);
+  } else {
+    const p = await guard(() => api.post<ProjectState>("/video/import", body));
+    store.set({ busy: null });
+    if (!p) return;
+    await openState(p);
+  }
+  if (o.autoRoto) await runAnalysis(true);
+}
+
+export const cancelImport = (): void => store.set({ importDraft: null });
+
+/** Dropping a video opens the import dialog (add as a layer when a project is open, like After Effects). */
+export const droppedPath = (path: string): Promise<void> => beginImport(path);
+export const importFile = (file: File): Promise<void> => stageFile(file);
 
 async function pick(kind: "video" | "project" | "folder" | "save-video", extra: { default_name?: string; ext?: string } = {}): Promise<string> {
   const r = await guard(() => api.post<{ path: string }>("/system/pick", { kind, ...extra }));
@@ -224,9 +238,7 @@ async function pick(kind: "video" | "project" | "folder" | "save-video", extra: 
 
 export async function browseVideo(asLayer = false): Promise<void> {
   const path = await pick("video");
-  if (!path) return;
-  if (asLayer && store.get().comp) await addLayerPath(path);
-  else await importPath(path);
+  if (path) await beginImport(path, asLayer);
 }
 
 export async function openProject(): Promise<void> {
@@ -374,6 +386,48 @@ export async function clearFrameMask(): Promise<void> {
   const frame = localFrameNow();
   if (frame === null) return;
   if (await guard(() => api.post("/mask/clear", { frame }))) await afterEdit();
+}
+
+// ------------------------------------------------------------------ AI after an edit (background, never blocks)
+let autoTimer: number | undefined;
+
+/** After the user applies a tool, let the AI carry the correction to nearby frames. Debounced, runs on the server in
+ * the background, and is cancelled by the server the moment another edit arrives. */
+export function scheduleAutoUpdate(localFrame: number): void {
+  const au = store.get().autoUpdate;
+  window.clearTimeout(autoTimer);
+  if (!au.enabled || (au.forward <= 0 && au.backward <= 0)) return;
+  autoTimer = window.setTimeout(() => {
+    const cur = store.get().autoUpdate;
+    if (!cur.enabled) return;
+    void api.post("/mask/auto-update", { frame: localFrame, forward: cur.forward, backward: cur.backward }).catch(() => undefined);
+  }, 900);
+}
+
+export function setAutoUpdate(patch: Partial<AutoUpdateSettings>): void {
+  const next = { ...store.get().autoUpdate, ...patch };
+  store.set({ autoUpdate: next });
+  try {
+    localStorage.setItem("zelfbrush.autoUpdate", JSON.stringify(next));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** Show the "AI working" chip while a request that runs the model is in flight. */
+export async function trackAi<T>(fn: () => Promise<T>): Promise<T> {
+  store.set((s) => ({ aiPending: s.aiPending + 1 }));
+  try {
+    return await fn();
+  } finally {
+    store.set((s) => ({ aiPending: Math.max(0, s.aiPending - 1) }));
+  }
+}
+
+let refreshTimer: number | undefined;
+function refreshSoon(): void {
+  window.clearTimeout(refreshTimer);
+  refreshTimer = window.setTimeout(() => void afterEdit(), 150);
 }
 
 // ------------------------------------------------------------------ undo / redo / settings

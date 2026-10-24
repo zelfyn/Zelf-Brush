@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api";
-import { afterEdit, browseVideo, importFile, localFrameNow, renderUrl, showError } from "../actions";
+import { activeLayer, afterEdit, browseVideo, cancelJob, importFile, localFrameNow, renderUrl, scheduleAutoUpdate, showError, trackAi } from "../actions";
 import { store, useApp } from "../store";
 import type { ViewMode } from "../types";
 
 type Pt = [number, number];
 const MODES: { id: ViewMode; label: string; key: string }[] = [
+  { id: "composite", label: "Composite", key: "C" },
   { id: "original", label: "Original", key: "O" },
   { id: "mask", label: "Mask", key: "M" },
   { id: "transparent", label: "Transparent", key: "T" },
   { id: "overlay", label: "Overlay", key: "V" },
   { id: "edge", label: "Problem areas", key: "E" },
   { id: "depth", label: "Depth", key: "D" },
-  { id: "composite", label: "Composite", key: "C" },
 ];
 
 function checker(): HTMLCanvasElement {
@@ -29,6 +29,22 @@ function checker(): HTMLCanvasElement {
 const CHECK = checker();
 const NEEDS_CHECKER: ViewMode[] = ["transparent", "composite"];
 
+/** The roto tools always act on the SELECTED layer. In the composite view a click is in comp space, so map it into that
+ * layer's own proxy pixels (undoing its fit, scale and position). `k` converts a length (brush size) the same way. */
+function layerMap(): { to: (p: Pt) => Pt; k: number } | null {
+  const s = store.get();
+  const L = activeLayer();
+  if (!s.comp || !s.project || !L) return null;
+  if (s.viewMode !== "composite") return { to: (p) => p, k: 1 };
+  const c = s.comp;
+  const sx = c.proxy.width / c.width;
+  const fit = Math.min(c.width / L.width, c.height / L.height);
+  const dw = L.width * fit * L.scale * sx, dh = L.height * fit * L.scale * sx;
+  const ox = (c.proxy.width - dw) / 2 + L.x * sx, oy = (c.proxy.height - dh) / 2 + L.y * sx;
+  const lw = s.project.proxy.width, lh = s.project.proxy.height;
+  return { to: (q) => [((q[0] - ox) / dw) * lw, ((q[1] - oy) / dh) * lh], k: lw / dw };
+}
+
 export function Viewport() {
   const project = useApp((s) => s.project);
   const comp = useApp((s) => s.comp);
@@ -39,6 +55,9 @@ export function Viewport() {
   const tool = useApp((s) => s.tool);
   const busy = useApp((s) => s.busy);
   const dropActive = useApp((s) => s.dropActive);
+  const aiPending = useApp((s) => s.aiPending);
+  const jobs = useApp((s) => s.jobs);
+  const autoJob = Object.values(jobs).find((j) => j.lane === "auto" && (j.status === "running" || j.status === "waiting"));
 
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -211,9 +230,10 @@ export function Viewport() {
     return [(e.clientX - r.left - v.tx) / v.s, (e.clientY - r.top - v.ty) / v.s];
   };
 
-  const send = async (path: string, body: Record<string, unknown>) => {
+  const send = async (path: string, body: Record<string, unknown>, localFrame?: number, usesAi = false) => {
     try {
-      await api.post(path, body);
+      await (usesAi ? trackAi(() => api.post(path, body)) : api.post(path, body));
+      if (localFrame !== undefined) scheduleAutoUpdate(localFrame);   // the edit is applied; the AI updates neighbours later
     } catch (err) {
       showError(err);
     }
@@ -228,8 +248,9 @@ export function Viewport() {
   const closePolygon = () => {
     const st = store.get();
     const lf = localFrameNow();
-    if (poly.current.length >= 3 && lf !== null)
-      void send("/mask/lasso", { frame: lf, polygon: poly.current, mode: st.lasso.mode, ai_refine: st.lasso.aiRefine });
+    const m = layerMap();
+    if (poly.current.length >= 3 && lf !== null && m)
+      void send("/mask/lasso", { frame: lf, polygon: poly.current.map(m.to), mode: st.lasso.mode, ai_refine: st.lasso.aiRefine }, lf, false);
     else poly.current = [];
     schedule();
   };
@@ -258,9 +279,8 @@ export function Viewport() {
       return;
     }
     if (e.button !== 0) return;
-    if (st.viewMode === "composite" || st.viewMode === "depth") {
-      // painting needs the layer's own view: switch to it instead of silently ignoring the click
-      store.set({ viewMode: "overlay" });
+    if (st.viewMode === "depth") {
+      store.set({ viewMode: "overlay" });   // the depth view is read-only: switch to a paintable view instead of ignoring the click
       return;
     }
     if (st.tool === "brush" || st.tool === "eraser") {
@@ -300,36 +320,38 @@ export function Viewport() {
     const st = store.get();
     if (active.current === "paint" && stroke.current.length) {
       const lf = localFrameNow();
-      if (lf === null) {
+      const m = layerMap();
+      if (lf === null || !m) {
         stroke.current = [];
         active.current = "none";
         schedule();
         return;
       }
       void send("/mask/stroke", {
-        frame: lf, mode: st.tool === "brush" ? "add" : "remove", points: stroke.current,
-        size: st.brush.size, hardness: st.brush.hardness, strength: st.brush.strength,
-      });
+        frame: lf, mode: st.tool === "brush" ? "add" : "remove", points: stroke.current.map(m.to),
+        size: Math.max(1, st.brush.size * m.k), hardness: st.brush.hardness, strength: st.brush.strength,
+      }, lf, false);
     } else if (active.current === "lasso") {
       active.current = "none";
       closePolygon();
     } else if (active.current === "box" && boxSel.current) {
       const { a, b } = boxSel.current;
       const lf = localFrameNow();
-      const sub = st.objectMode === "subtract";
+      const m = layerMap();
       const dragged = Math.hypot((b[0] - a[0]) * view.current.s, (b[1] - a[1]) * view.current.s) > 8;
       boxSel.current = null;
-      if (lf === null) {
+      if (lf === null || !m) {
         active.current = "none";
         schedule();
         return;
       }
-      const mode = sub ? "subtract" : "add";
+      const mode = st.objectMode === "subtract" ? "subtract" : "add";
+      const la = m.to(a), lb = m.to(b);
       if (dragged) {
-        const x = Math.round(Math.min(a[0], b[0])), y = Math.round(Math.min(a[1], b[1]));
-        void send("/segmentation/select", { frame: lf, mode, box: [x, y, Math.round(Math.abs(b[0] - a[0])), Math.round(Math.abs(b[1] - a[1]))] });
+        const x = Math.round(Math.min(la[0], lb[0])), y = Math.round(Math.min(la[1], lb[1]));
+        void send("/segmentation/select", { frame: lf, mode, box: [x, y, Math.round(Math.abs(lb[0] - la[0])), Math.round(Math.abs(lb[1] - la[1]))] }, lf, true);
       } else {
-        void send("/segmentation/select", { frame: lf, mode, points: [a] });
+        void send("/segmentation/select", { frame: lf, mode, points: [la] }, lf, true);
       }
     } else {
       active.current = "none";
@@ -359,6 +381,12 @@ export function Viewport() {
           ))}
         </div>
         <span className="spacer" />
+        {(aiPending > 0 || autoJob) && (
+          <span className="chip" role="status" aria-live="polite">
+            <i />{aiPending > 0 ? "AI detecting…" : autoJob?.message || autoJob?.title || "AI updating…"}
+            {autoJob && aiPending === 0 && <button onClick={() => void cancelJob(autoJob.id)} title="Stop the background update">Stop</button>}
+          </span>
+        )}
         <label title="Resolution used for preview frames. Masks are edited at proxy size; export uses the original.">
           Preview{" "}
           <select value={quality} onChange={(e) => store.set({ previewQuality: Number(e.target.value) as 25 | 50 | 75 | 100 })}>
@@ -369,7 +397,11 @@ export function Viewport() {
         </label>
         <button onClick={fitView} title="Fit to window">Fit</button>
       </div>
-      <div className="stage" ref={stageRef}>
+      <div className="stage" ref={stageRef} onDragOver={(e) => e.preventDefault()} onDrop={(e) => {
+        e.preventDefault();
+        const f = e.dataTransfer.files[0];
+        if (f) void importFile(f);
+      }}>
         <canvas
           ref={canvasRef}
           style={{ cursor, touchAction: "none" }}

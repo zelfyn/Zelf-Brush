@@ -1,6 +1,7 @@
 """Editing operations: brush/eraser/lasso/object select, viewport rendering, analysis, auto roto, propagation."""
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -13,12 +14,22 @@ import numpy as np
 from . import matte
 from .config import LOW_CONFIDENCE
 from .engines import get_engine
+from .engines.onnx_engine import interactive
 from .engines.base import Detection, EngineError
 from .jobs import Job
 from .project import Project
 from .video import MediaError
 
 log = logging.getLogger("rotobrush.ai")
+
+
+def _interactive(fn):
+    """The user is waiting for this call: its AI inference jumps ahead of any background tracking job."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with interactive():
+            return fn(*a, **k)
+    return wrapper
 
 
 def _eng(p: Project):
@@ -97,23 +108,50 @@ def brush(p: Project, frame: int, mode: str, points, size: float, hardness: floa
         _mark_user(p, frame, "brush" if mode == "add" else "eraser")
 
 
-def lasso(p: Project, frame: int, polygon, mode: str, ai_refine: bool) -> None:
+def lasso(p: Project, frame: int, polygon, mode: str, ai_refine: bool = False, defer_refine: bool = False) -> dict | None:
+    """Apply the lasso. With defer_refine the polygon is applied INSTANTLY and the AI edge-snap is left for
+    lasso_refine() to do in the background (no waiting); the returned dict is what that step needs."""
     prior = polygon_mask(p.masks.get(frame).shape, polygon)
-    if ai_refine:
-        eng, ctx = _eng(p)
-        band = int(np.clip(0.02 * max(prior.shape), 3, 14))
-        with ctx():
-            region = eng.interactive.refine_prior(p.frame_bgr(frame), prior, band)
-    else:
-        region = prior
-    with p.lock, p.masks.operation("Lasso"):
-        cur = p.masks.get(frame).astype(np.float32)
+    region = prior
+    if ai_refine and not defer_refine:
+        region = _lasso_region(p, frame, prior)
+    with p.masks.operation("Lasso"):
+        before = p.masks.get(frame)
+        cur = before.astype(np.float32)
         r = region.astype(np.float32) / 255.0
         out = np.maximum(cur, r * 255.0) if mode == "add" else cur * (1.0 - r)
         p.masks.set(frame, out)
         _mark_user(p, frame, "lasso")
+    if ai_refine and defer_refine:
+        return {"before": before, "prior": prior, "mode": mode, "version": p.masks.version(frame)}
+    return None
 
 
+@_interactive
+def _lasso_region(p: Project, frame: int, prior: np.ndarray) -> np.ndarray:
+    eng, ctx = _eng(p)
+    band = int(np.clip(0.02 * max(prior.shape), 3, 14))
+    with ctx():
+        return eng.interactive.refine_prior(p.frame_bgr(frame), prior, band)
+
+
+def lasso_refine(p: Project, frame: int, pending: dict, job: Job | None = None) -> dict:
+    """Background step: snap the lasso to real edges, unless the user touched this frame again in the meantime."""
+    region = _lasso_region(p, frame, pending["prior"])
+    if job:
+        job.update(0.9, "Applying")
+    if p.masks.version(frame) != pending["version"]:
+        log.info("AI refine of the lasso on frame %d dropped: the frame was edited again", frame)
+        return {"applied": False}
+    cur = pending["before"].astype(np.float32)
+    r = region.astype(np.float32) / 255.0
+    out = np.maximum(cur, r * 255.0) if pending["mode"] == "add" else cur * (1.0 - r)
+    with p.masks.operation("AI refine", merge=True):  # folds into the lasso's undo step: one Ctrl+Z undoes both
+        p.masks.set(frame, out)
+    return {"applied": True}
+
+
+@_interactive
 def select_object(p: Project, frame: int, mode: str, points: list | None, negative: list | None,
                   box: list | None, object_id: str | None) -> None:
     eng, ctx = _eng(p)
@@ -154,6 +192,7 @@ def clear_mask(p: Project, frame: int) -> None:
 
 
 # ------------------------------------------------------------------ analysis / auto roto
+@_interactive
 def analyze(p: Project, frame: int | None = None) -> dict:
     """Frame-sample the clip, detect subjects on the sampled frames and pick the best anchor frame."""
     eng, ctx = _eng(p)
@@ -197,10 +236,12 @@ def analyze(p: Project, frame: int | None = None) -> dict:
 
 
 def _propagate_segment(p: Project, eng, start: int, step: int, stop_at: int | None, job: Job | None,
-                       counter: list[int], total: int) -> None:
+                       counter: list[int], total: int, max_frames: int | None = None) -> None:
     last = p.n_frames - 1 if step > 0 else 0
     wa = p.data["workArea"]
     last = min(last, wa["out"]) if step > 0 else max(last, wa["in"])
+    if max_frames is not None:
+        last = min(last, start + max_frames) if step > 0 else max(last, start - max_frames)
     if (step > 0 and start >= last) or (step < 0 and start <= last):
         return
     seed = p.masks.get(start)
@@ -208,6 +249,8 @@ def _propagate_segment(p: Project, eng, start: int, step: int, stop_at: int | No
         return
 
     def on_frame(idx: int, m: np.ndarray, conf: float) -> None:
+        if idx in p.user_keyframes():  # the user corrected this frame after we started: never overwrite their work
+            return
         p.masks.set(idx, m)
         p.set_confidence(idx, conf)
         counter[0] += 1
@@ -218,7 +261,8 @@ def _propagate_segment(p: Project, eng, start: int, step: int, stop_at: int | No
                            (lambda: job.cancelled) if job else (lambda: False), on_frame)
 
 
-def propagate(p: Project, frame: int, direction: str, job: Job | None = None, recalc: bool = False) -> dict:
+def propagate(p: Project, frame: int, direction: str, job: Job | None = None, recalc: bool = False,
+              limit: dict | None = None, merge: bool = False) -> dict:
     """Propagate the mask at `frame` through time.
 
     forward/backward/both stop at the next user-corrected keyframe. `recalc` re-tracks everything after
@@ -231,8 +275,7 @@ def propagate(p: Project, frame: int, direction: str, job: Job | None = None, re
     wa = p.data["workArea"]
     users = [k for k in p.user_keyframes() if k != frame]
     counter = [0]
-    with p.lock:
-        p.add_keyframe(frame, "ai" if frame not in p.user_keyframes() else "user")
+    p.add_keyframe(frame, "ai" if frame not in p.user_keyframes() else "user")
 
     def segs(step: int) -> list[tuple[int, int | None]]:
         after = sorted(k for k in users if (k > frame if step > 0 else k < frame))
@@ -241,22 +284,34 @@ def propagate(p: Project, frame: int, direction: str, job: Job | None = None, re
             return [(frame, after[0] if after else None)] + [(a, after[i + 1] if i + 1 < len(after) else None) for i, a in enumerate(after)]
         return [(frame, after[0] if after else None)]
 
-    plan: list[tuple[int, int, int | None]] = []
+    lim = limit or {}
+    plan: list[tuple[int, int, int | None, int | None]] = []
     if direction in ("forward", "both"):
-        plan += [(s, 1, stop) for s, stop in segs(1)]
+        plan += [(s, 1, stop, lim.get("forward")) for s, stop in segs(1)]
     if direction in ("backward", "both"):
-        plan += [(s, -1, stop) for s, stop in segs(-1)]
+        plan += [(s, -1, stop, lim.get("backward")) for s, stop in segs(-1)]
     total = 0
-    for s, step, stop in plan:
+    for s, step, stop, maxf in plan:
         end = (stop if stop is not None else (wa["out"] + 1 if step > 0 else wa["in"] - 1))
-        total += max(0, abs(end - s) - (0 if stop is None else 0))
+        span = max(0, abs(end - s))
+        total += min(span, maxf) if maxf is not None else span
     label = "Recalculate" if recalc else f"Propagate {direction}"
-    with p.lock, p.masks.operation(label), ctx():
-        for s, step, stop in plan:
-            _propagate_segment(p, eng, s, step, stop, job, counter, total)
+    # No lock is held while tracking: previews, edits and the timeline stay responsive for the whole run.
+    with p.masks.operation(label, merge=merge), ctx():
+        for s, step, stop, maxf in plan:
+            _propagate_segment(p, eng, s, step, stop, job, counter, total, maxf)
     p.save_tracking()
     low = [f for f, c in p.data["tracking"]["confidence"].items() if c < LOW_CONFIDENCE]
     return {"frames": counter[0], "low_confidence": len(low), "engine": eng.name}
+
+
+def auto_update(p: Project, frame: int, forward: int, backward: int, job: Job | None = None) -> dict:
+    """After a manual edit: let the AI carry the correction to the neighbouring frames (limited range, cancellable)."""
+    forward, backward = max(0, int(forward)), max(0, int(backward))
+    if (forward <= 0 and backward <= 0) or not p.masks.has(frame) or not (p.masks.get(frame) > 127).any():
+        return {"frames": 0, "skipped": True}
+    direction = "both" if forward > 0 and backward > 0 else ("forward" if forward > 0 else "backward")
+    return propagate(p, frame, direction, job, limit={"forward": forward, "backward": backward}, merge=True)
 
 
 def auto_roto(p: Project, frame: int, object_ids: list[str] | None, job: Job | None = None) -> dict:
@@ -332,7 +387,8 @@ def render(p: Project, frame: int, mode: str, quality: int) -> tuple[bytes, str]
         png = True
     elif mode == "depth":
         from . import depth as depthmod
-        img = depthmod.colorize(depthmod.frame_depth(p, frame))
+        with interactive():
+            img = depthmod.colorize(depthmod.frame_depth(p, frame))
     elif mode == "overlay":
         tint = np.array([255, 120, 50], np.float32)  # BGR blue, contrasts with warm subjects
         base = bgr.astype(np.float32)

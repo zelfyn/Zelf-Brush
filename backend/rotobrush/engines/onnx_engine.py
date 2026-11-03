@@ -395,6 +395,37 @@ class OnnxEngine(SegmentationEngine):
         rt = self._primary
         return bool(rt and rt.accelerated)
 
+    def info(self) -> dict:
+        """Return one consistent snapshot of the active ONNX runtime status.
+
+        Read _primary only once: model selection can replace/remove runtimes while
+        the API is building its status response. Reading provider and accelerated
+        independently could otherwise report contradictory GPU information.
+        """
+        rt = self._primary
+        if rt is None:
+            return {
+                "name": self.name,
+                "description": self.description,
+                "provider": "pending",
+                "accelerated": False,
+                "ready": False,
+            }
+
+        provider_name = {
+            "CUDAExecutionProvider": "CUDA",
+            "DmlExecutionProvider": "DirectML",
+        }.get(rt.provider, "CPU")
+        accelerated = provider_name != "CPU"
+
+        return {
+            "name": self.name,
+            "description": f"ONNX Runtime on {provider_name}: IS-Net/U²-Net ({', '.join(self._rts) or 'loading'}) + optical-flow tracking",
+            "provider": provider_name,
+            "accelerated": accelerated,
+            "ready": True,
+        }
+
     @property
     def description(self) -> str:  # type: ignore[override]
         loaded = ", ".join(self._rts) or "loading"

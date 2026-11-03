@@ -10,6 +10,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ def _atomic_write(path: Path, text: str) -> None:
 class Project:
     def __init__(self, root: Path, data: dict, recovered: bool = False) -> None:
         self.root = Path(root)
+        self.render_cache_id = uuid.uuid4().hex
         self.data = data
         self.recovered = recovered
         self.dirty = False

@@ -1117,9 +1117,32 @@ import threading  # noqa: E402
 
 
 def _soft_per_contour_px(a_u8: np.ndarray) -> float:
+    if a_u8 is None or a_u8.size == 0:
+        raise AssertionError(
+            "Rendered mask image is empty or could not be decoded"
+        )
+
     soft = int(((a_u8 > 12) & (a_u8 < 243)).sum())
-    cnt = max(cv2.findContours((a_u8 > 127).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0], key=cv2.contourArea)
-    return soft / cv2.arcLength(cnt, True)
+
+    contours = cv2.findContours(
+        (a_u8 > 127).astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE
+    )[0]
+
+    if not contours:
+        raise AssertionError(
+            "Rendered mask contains no foreground contour; "
+            "check project mask data and render cache isolation"
+        )
+
+    cnt = max(contours, key=cv2.contourArea)
+    perimeter = cv2.arcLength(cnt, True)
+
+    if perimeter <= 0:
+        raise AssertionError("Rendered mask contour has zero perimeter")
+
+    return soft / perimeter
 
 
 def test_edges_are_crisp_by_default_and_feather_is_only_what_the_user_adds(client, clips):

@@ -370,7 +370,7 @@ def view_alpha(p: Project, frame: int, bgr: np.ndarray) -> np.ndarray:
 
 def render(p: Project, frame: int, mode: str, quality: int) -> tuple[bytes, str]:
     settings = p.data["maskSettings"]
-    key = f"{frame}:{mode}:{quality}:{p.masks.version(frame)}:{_settings_hash(settings)}:{int(p.masks.has(frame))}"
+    key = f"{p.render_cache_id}:{frame}:{mode}:{quality}:{p.masks.version(frame)}:{_settings_hash(settings)}:{int(p.masks.has(frame))}"
     if key in _render_cache:
         _render_cache.move_to_end(key)
         mt_b, data = _render_cache[key].split(b"\0", 1)

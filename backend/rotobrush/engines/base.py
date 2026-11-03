@@ -57,6 +57,7 @@ class SegmentationEngine:
     description = ""
     provider = "CPU"          # what actually runs the neural network: CPU / CUDA / DirectML ...
     accelerated = False       # True only when a GPU runs the inference
+    ready = True              # False while a model is still loading: provider/accelerated are not known yet
     detection: ObjectDetection
     interactive: InteractiveSegmentation
     temporal: TemporalPropagation
@@ -70,4 +71,4 @@ class SegmentationEngine:
 
     def info(self) -> dict:
         return {"name": self.name, "description": self.description, "provider": self.provider,
-                "accelerated": self.accelerated}
+                "accelerated": self.accelerated, "ready": self.ready}

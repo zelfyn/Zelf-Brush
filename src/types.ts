@@ -118,7 +118,7 @@ export interface SystemStatus {
   models?: { segmentation: string[]; depth: boolean };
   gpu: GpuInfo;
   engines: EngineInfo[];
-  active_engine: { name: string; description: string; provider: string; accelerated: boolean };
+  active_engine: { name: string; description: string; provider: string; accelerated: boolean; ready: boolean };
 }
 
 export interface AppError {

@@ -10,6 +10,7 @@ export function StatusBar() {
   const engine = useApp((s) => s.activeEngine);
   const provider = useApp((s) => s.engineProvider);
   const accel = useApp((s) => s.engineAccelerated);
+  const ready = useApp((s) => s.engineReady);
   const open = useApp((s) => s.queueOpen);
   const active = Object.values(jobs).filter((j) => j.status === "running");
   const job = active[0];
@@ -24,7 +25,9 @@ export function StatusBar() {
         </>
       ) : <span>No project</span>}
       <span title={accel ? "AI inference runs on the GPU" : gpu?.detected ? "A GPU exists but the active AI engine is running on the CPU. Pick a GPU engine in Properties > Engine, or check the AI model is installed." : gpu?.message}>
-        {accel
+        {!ready
+          ? "AI model loading…"
+          : accel
           ? <>GPU: <b>{gpu?.name ?? "GPU"}</b> {vram} · <b>{provider}</b> (AI on GPU)</>
           : gpu?.detected ? <>GPU: <b>{gpu.name}</b> · AI running on CPU</> : "No NVIDIA GPU detected · CPU mode"}
       </span>

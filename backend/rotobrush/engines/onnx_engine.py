@@ -378,16 +378,17 @@ class OnnxEngine(SegmentationEngine):
         return next(iter(self._rts.values()), None)
 
     @property
+    def ready(self) -> bool:  # type: ignore[override]
+        return self._primary is not None
+
+    @property
     def provider(self) -> str:  # type: ignore[override]
+        """What really runs the model. 'pending' until a model has loaded: guessing from the installed providers would
+        claim a GPU on machines (or CI runners) that have the DirectML runtime but no usable device."""
         rt = self._primary
-        if rt is not None:
-            return {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}.get(rt.provider, "CPU")
-        try:
-            import onnxruntime as ort
-            av = ort.get_available_providers()
-            return "CUDA" if "CUDAExecutionProvider" in av else "DirectML" if "DmlExecutionProvider" in av else "CPU"
-        except Exception:  # noqa: BLE001
-            return "CPU"
+        if rt is None:
+            return "pending"
+        return {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}.get(rt.provider, "CPU")
 
     @property
     def accelerated(self) -> bool:  # type: ignore[override]

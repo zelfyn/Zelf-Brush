@@ -24,6 +24,7 @@ export interface AppState {
   activeEngine: string;
   engineProvider: string;
   engineAccelerated: boolean;
+  engineReady: boolean;
   error: AppError | null;
   toast: string | null;
   dialog: null | "export";
@@ -52,7 +53,7 @@ const initial: AppState = {
   brush: { size: 40, hardness: 1, strength: 1 },
   lasso: { mode: "add", shape: "freehand", aiRefine: true },
   objectMode: "add", renderKey: 0, detections: [], analysis: "idle", jobs: {},
-  gpu: null, engines: [], activeEngine: "", engineProvider: "CPU", engineAccelerated: false, error: null, toast: null, dialog: null, exportKind: "mp4",
+  gpu: null, engines: [], activeEngine: "", engineProvider: "CPU", engineAccelerated: false, engineReady: true, error: null, toast: null, dialog: null, exportKind: "mp4",
   queueOpen: false, busy: null, importDraft: null, aiPending: 0,
   autoUpdate: loadAutoUpdate(), dropActive: false,
 };

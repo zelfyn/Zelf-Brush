@@ -576,8 +576,13 @@ def test_onnx_engine_is_listed_and_reports_its_device(client, onnx_project):
     st = client.get("/system/status").json()
     assert next(e for e in st["engines"] if e["name"] == "onnx")["available"]
     eng = st["active_engine"]
-    assert eng["name"] == "onnx" and eng["provider"] in ("CPU", "CUDA", "DirectML")
-    assert eng["accelerated"] == (eng["provider"] != "CPU")
+    assert eng["name"] == "onnx"
+    # before any model has loaded nothing is claimed: no guessing a GPU from the installed providers
+    assert eng["ready"] is False and eng["provider"] == "pending" and eng["accelerated"] is False
+    engine_registry.get_engine("onnx").runtime()                     # load a model (a GPU-less machine falls back to the CPU)
+    eng = client.get("/system/status").json()["active_engine"]
+    assert eng["ready"] is True and eng["provider"] in ("CPU", "CUDA", "DirectML")
+    assert eng["accelerated"] == (eng["provider"] != "CPU"), "provider and accelerated must always agree"
 
 
 @needs_model
@@ -1117,7 +1122,10 @@ def _soft_per_contour_px(a_u8: np.ndarray) -> float:
     return soft / cv2.arcLength(cnt, True)
 
 
-def test_edges_are_crisp_by_default_and_feather_is_only_what_the_user_adds(client, rb):
+def test_edges_are_crisp_by_default_and_feather_is_only_what_the_user_adds(client, clips):
+    client.post("/video/import", json={"path": str(clips["mp4"])})          # its own project: never a stale shared fixture
+    wait_cache(client)
+    _fill_masks(S.project)
     f = 10
     mask_png = lambda: cv2.imdecode(np.frombuffer(client.get(f"/render/{f}", params={"mode": "mask"}).content, np.uint8), cv2.IMREAD_GRAYSCALE)  # noqa: E731
     assert client.get("/project").json()["maskSettings"]["hardEdge"] is True
@@ -1355,4 +1363,26 @@ def test_interactive_ai_calls_jump_ahead_of_background_ones():
     th.join()
     assert max(waits) < 0.3, f"an interactive call waited {max(waits):.2f}s behind background inference"
     del rt
+    engine_registry.reset_engines()
+
+
+@needs_model
+def test_status_never_claims_a_gpu_when_directml_exists_but_no_device_does(client, onnx_project, monkeypatch):
+    """CI runners have the DirectML runtime but no GPU: ORT lists the provider, then fails to create a device."""
+    import onnxruntime as ort
+    real = ort.InferenceSession
+
+    def no_device(path, sess_options=None, providers=None, **kw):
+        if providers and providers[0] == "DmlExecutionProvider":
+            raise RuntimeError("No devices detected that match the filter criteria")
+        return real(path, sess_options=sess_options, providers=["CPUExecutionProvider"], **kw)
+
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["DmlExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(ort, "InferenceSession", no_device)
+    engine_registry.reset_engines()
+    eng = client.get("/system/status").json()["active_engine"]
+    assert (eng["ready"], eng["provider"], eng["accelerated"]) == (False, "pending", False)   # not guessing "DirectML"
+    engine_registry.get_engine("onnx").runtime()
+    eng = client.get("/system/status").json()["active_engine"]
+    assert (eng["ready"], eng["provider"], eng["accelerated"]) == (True, "CPU", False)
     engine_registry.reset_engines()

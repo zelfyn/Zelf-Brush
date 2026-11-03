@@ -118,7 +118,7 @@ export async function boot(): Promise<void> {
 async function pollStatus(): Promise<void> {
   try {
     const st = await api.get<SystemStatus>("/system/status");
-    store.set({ gpu: st.gpu, engines: st.engines, activeEngine: st.active_engine.name, engineProvider: st.active_engine.provider, engineAccelerated: st.active_engine.accelerated });
+    store.set({ gpu: st.gpu, engines: st.engines, activeEngine: st.active_engine.name, engineProvider: st.active_engine.provider, engineAccelerated: st.active_engine.accelerated, engineReady: st.active_engine.ready });
   } catch {
     /* transient */
   }

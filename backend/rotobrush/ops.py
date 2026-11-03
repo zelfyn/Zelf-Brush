@@ -370,7 +370,11 @@ def view_alpha(p: Project, frame: int, bgr: np.ndarray) -> np.ndarray:
 
 def render(p: Project, frame: int, mode: str, quality: int) -> tuple[bytes, str]:
     settings = p.data["maskSettings"]
-    key = f"{p.render_cache_id}:{frame}:{mode}:{quality}:{p.masks.version(frame)}:{_settings_hash(settings)}:{int(p.masks.has(frame))}"
+    # Rendered frames belong to a project. The cache is process-global, so frame/mask
+    # versions alone are not unique: two projects can both have frame 10 at version 1.
+    # Include the stable project root to prevent one project's image being served for another.
+    project_key = str(p.root.resolve())
+    key = f"{project_key}:{frame}:{mode}:{quality}:{p.masks.version(frame)}:{_settings_hash(settings)}:{int(p.masks.has(frame))}"
     if key in _render_cache:
         _render_cache.move_to_end(key)
         mt_b, data = _render_cache[key].split(b"\0", 1)

@@ -1117,32 +1117,11 @@ import threading  # noqa: E402
 
 
 def _soft_per_contour_px(a_u8: np.ndarray) -> float:
-    if a_u8 is None or a_u8.size == 0:
-        raise AssertionError(
-            "Rendered mask image is empty or could not be decoded"
-        )
-
     soft = int(((a_u8 > 12) & (a_u8 < 243)).sum())
-
-    contours = cv2.findContours(
-        (a_u8 > 127).astype(np.uint8),
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE
-    )[0]
-
-    if not contours:
-        raise AssertionError(
-            "Rendered mask contains no foreground contour; "
-            "check project mask data and render cache isolation"
-        )
-
+    contours = cv2.findContours((a_u8 > 127).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+    assert contours, "rendered mask is empty: no foreground contour was found"
     cnt = max(contours, key=cv2.contourArea)
-    perimeter = cv2.arcLength(cnt, True)
-
-    if perimeter <= 0:
-        raise AssertionError("Rendered mask contour has zero perimeter")
-
-    return soft / perimeter
+    return soft / cv2.arcLength(cnt, True)
 
 
 def test_edges_are_crisp_by_default_and_feather_is_only_what_the_user_adds(client, clips):
@@ -1161,6 +1140,70 @@ def test_edges_are_crisp_by_default_and_feather_is_only_what_the_user_adds(clien
     assert _soft_per_contour_px(mask_png()) > 1.0, "the old soft behaviour is still available as an opt-out"
     client.patch("/project/settings", json={"maskSettings": {"hardEdge": True}})
     assert _soft_per_contour_px(mask_png()) < 0.3
+
+
+def test_render_cache_is_scoped_to_project(tmp_path, monkeypatch):
+    """Two projects can have identical frame/mask versions but different mask pixels."""
+    from collections import OrderedDict
+    from rotobrush import matte, ops
+
+    monkeypatch.setattr(ops, "_render_cache", OrderedDict())
+
+    class Masks:
+        def __init__(self, mask):
+            self.mask = mask
+
+        def version(self, frame):
+            return 1
+
+        def has(self, frame):
+            return True
+
+        def get(self, frame):
+            return self.mask.copy()
+
+    class ProjectLike:
+        def __init__(self, root, mask):
+            self.root = root
+            self.data = {"maskSettings": dict(matte.DEFAULT_MATTE)}
+            self.masks = Masks(mask)
+
+        def frame_bgr(self, frame):
+            return np.full((*self.masks.mask.shape, 3), 120, np.uint8)
+
+    empty = np.zeros((120, 160), np.uint8)
+    filled = empty.copy()
+    cv2.ellipse(filled, (80, 60), (35, 45), 0, 0, 360, 255, -1)
+    a = ProjectLike(tmp_path / "project_a", empty)
+    b = ProjectLike(tmp_path / "project_b", filled)
+
+    img_a = cv2.imdecode(np.frombuffer(ops.render(a, 10, "mask", 100)[0], np.uint8), cv2.IMREAD_COLOR)
+    img_b = cv2.imdecode(np.frombuffer(ops.render(b, 10, "mask", 100)[0], np.uint8), cv2.IMREAD_COLOR)
+    assert not (img_a[..., 0] > 127).any()
+    assert (img_b[..., 0] > 127).any(), "project B must not receive project A's cached empty mask"
+
+
+def test_onnx_status_uses_one_provider_snapshot():
+    """A GPU-to-CPU fallback must not produce a mismatched provider/accelerated pair."""
+    class ChangingRuntime:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.reads = 0
+
+        @property
+        def provider(self):
+            self.reads += 1
+            return "DmlExecutionProvider" if self.reads == 1 else "CPUExecutionProvider"
+
+    eng = object.__new__(onnx_engine.OnnxEngine)
+    eng._lock = threading.Lock()
+    runtime = ChangingRuntime()
+    eng._rts = {"fast": runtime}
+
+    info = eng.info()
+    assert info["provider"] == "DirectML"
+    assert info["accelerated"] is True
+    assert runtime.reads == 1, "provider must be read only once for one status response"
 
 
 def test_detected_masks_are_stored_hard(client, clips):

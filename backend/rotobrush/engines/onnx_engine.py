@@ -395,35 +395,36 @@ class OnnxEngine(SegmentationEngine):
         rt = self._primary
         return bool(rt and rt.accelerated)
 
-    def info(self) -> dict:
-        """Return one consistent snapshot of the active ONNX runtime status.
+    def info(self) -> dict:  # type: ignore[override]
+        """Return provider/readiness fields from one consistent runtime snapshot.
 
-        Read _primary only once: model selection can replace/remove runtimes while
-        the API is building its status response. Reading provider and accelerated
-        independently could otherwise report contradictory GPU information.
+        OrtRuntime can replace a failed GPU session with a CPU session during inference.
+        Reading `provider` and `accelerated` separately could otherwise straddle that
+        replacement and report an impossible pair such as DirectML + False.
         """
-        rt = self._primary
-        if rt is None:
-            return {
-                "name": self.name,
-                "description": self.description,
-                "provider": "pending",
-                "accelerated": False,
-                "ready": False,
-            }
-
-        provider_name = {
-            "CUDAExecutionProvider": "CUDA",
-            "DmlExecutionProvider": "DirectML",
-        }.get(rt.provider, "CPU")
-        accelerated = provider_name != "CPU"
+        with self._lock:
+            rt = next(iter(self._rts.values()), None)
+            loaded = ", ".join(self._rts) or "loading"
+            if rt is None:
+                provider, accelerated, ready = "pending", False, False
+            else:
+                # infer() uses this same lock while replacing the session on GPU failure.
+                # Keep the engine lock too, so choose_model() cannot remove this runtime
+                # halfway through the status snapshot.
+                with rt.lock:
+                    raw_provider = rt.provider
+                    provider = {"CUDAExecutionProvider": "CUDA", "DmlExecutionProvider": "DirectML"}.get(
+                        raw_provider, "CPU"
+                    )
+                    accelerated = provider != "CPU"
+                    ready = True
 
         return {
             "name": self.name,
-            "description": f"ONNX Runtime on {provider_name}: IS-Net/U²-Net ({', '.join(self._rts) or 'loading'}) + optical-flow tracking",
-            "provider": provider_name,
+            "description": f"ONNX Runtime on {provider}: IS-Net/U²-Net ({loaded}) + optical-flow tracking",
+            "provider": provider,
             "accelerated": accelerated,
-            "ready": True,
+            "ready": ready,
         }
 
     @property
